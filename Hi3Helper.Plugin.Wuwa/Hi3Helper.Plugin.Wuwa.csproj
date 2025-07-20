@@ -31,4 +31,8 @@
 		<PackageReference Include="System.IO.Hashing" Version="9.0.6" />
 	</ItemGroup>
 
+	<ItemGroup>
+	  <Folder Include="Management\Api\" />
+	</ItemGroup>
+
 </Project>
