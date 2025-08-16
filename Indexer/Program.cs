@@ -1,24 +1,25 @@
 ﻿using Hi3Helper.Plugin.Core;
-using Hi3Helper.Plugin.Core.ABI;
 using Hi3Helper.Plugin.Core.Management;
 using Hi3Helper.Plugin.Core.Update;
-using Hi3Helper.Plugin.Core.Utility;
 using System;
 using System.Buffers;
+using System.Buffers.Text;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+// ReSharper disable AccessToDisposedClosure
 
-namespace PluginIndexer;
+namespace Indexer;
 
 public class SelfUpdateAssetInfo
 {
@@ -33,6 +34,7 @@ public class Program
 {
     private static readonly string[]             AllowedPluginExt             = [".dll", ".exe", ".so", ".dylib"];
     private static readonly SearchValues<string> AllowedPluginExtSearchValues = SearchValues.Create(AllowedPluginExt, StringComparison.OrdinalIgnoreCase);
+    private static readonly string               PackageExtension             = ".zip";
 
     public static int Main(params string[] args)
     {
@@ -51,7 +53,7 @@ public class Program
                 return 2;
             }
 
-            FileInfo? fileInfo = FindPluginLibraryAndGetAssets(path, out List<SelfUpdateAssetInfo> assetInfo, out SelfUpdateReferenceInfo? reference);
+            FileInfo? fileInfo = FindPluginLibraryAndGetAssets(path, out List<SelfUpdateAssetInfo> assetInfo, out PluginManifest? reference);
             if (fileInfo == null || reference == null || string.IsNullOrEmpty(reference.MainLibraryName))
             {
                 Console.Error.WriteLine("No valid plugin library was found.");
@@ -59,7 +61,8 @@ public class Program
             }
 
             string referenceFilePath = Path.Combine(path, "manifest.json");
-            return WriteToJson(reference, referenceFilePath, assetInfo);
+            int retCode = WriteToJson(reference, referenceFilePath, assetInfo);
+            return retCode != 0 ? retCode : PackFiles(path, reference, assetInfo);
         }
         catch (Exception ex)
         {
@@ -68,7 +71,7 @@ public class Program
         }
     }
 
-    private static int WriteToJson(SelfUpdateReferenceInfo reference, string referenceFilePath, List<SelfUpdateAssetInfo> assetInfo)
+    private static int WriteToJson(PluginManifest reference, string referenceFilePath, List<SelfUpdateAssetInfo> assetInfo)
     {
         DateTimeOffset creationDate = reference.PluginCreationDate.ToOffset(reference.PluginCreationDate.Offset);
 
@@ -91,14 +94,18 @@ public class Program
 
         writer.WriteStartObject();
 
-        writer.WriteString(nameof(SelfUpdateReferenceInfo.MainLibraryName), reference.MainLibraryName);
-        writer.WriteString(nameof(SelfUpdateReferenceInfo.MainPluginName), reference.MainPluginName);
-        writer.WriteString(nameof(SelfUpdateReferenceInfo.MainPluginAuthor), reference.MainPluginAuthor);
-        writer.WriteString(nameof(SelfUpdateReferenceInfo.MainPluginDescription), reference.MainPluginDescription);
-        writer.WriteString(nameof(SelfUpdateReferenceInfo.PluginStandardVersion), reference.PluginStandardVersion.ToString());
-        writer.WriteString(nameof(SelfUpdateReferenceInfo.PluginVersion), reference.PluginVersion.ToString());
-        writer.WriteString(nameof(SelfUpdateReferenceInfo.PluginCreationDate), creationDate);
-        writer.WriteString(nameof(SelfUpdateReferenceInfo.ManifestDate), DateTimeOffset.Now);
+        writer.WriteString(nameof(PluginManifest.MainLibraryName), reference.MainLibraryName);
+        writer.WriteString(nameof(PluginManifest.MainPluginName), reference.MainPluginName);
+        writer.WriteString(nameof(PluginManifest.MainPluginAuthor), reference.MainPluginAuthor);
+        writer.WriteString(nameof(PluginManifest.MainPluginDescription), reference.MainPluginDescription);
+        writer.WriteString(nameof(PluginManifest.PluginStandardVersion), reference.PluginStandardVersion.ToString());
+        writer.WriteString(nameof(PluginManifest.PluginVersion), reference.PluginVersion.ToString());
+        writer.WriteString(nameof(PluginManifest.PluginCreationDate), creationDate);
+        writer.WriteString(nameof(PluginManifest.ManifestDate), reference.ManifestDate);
+        if (reference.PluginAlternativeIcon?.Length != 0)
+        {
+            writer.WriteString(nameof(PluginManifest.PluginAlternativeIcon), reference.PluginAlternativeIcon);
+        }
 
         writer.WriteStartArray("Assets");
         foreach (var asset in assetInfo)
@@ -120,7 +127,76 @@ public class Program
         return 0;
     }
 
-    private static FileInfo? FindPluginLibraryAndGetAssets(string dirPath, out List<SelfUpdateAssetInfo> fileList, out SelfUpdateReferenceInfo? referenceInfo)
+    private static int PackFiles(string outputPath, PluginManifest referenceInfo, List<SelfUpdateAssetInfo> fileList)
+    {
+        string packageName = $"{Path.GetFileNameWithoutExtension(referenceInfo.MainLibraryName)}_{referenceInfo.PluginVersion}_API-{referenceInfo.PluginStandardVersion}_{referenceInfo.ManifestDate.ToString("yyyyMMdd")}";
+        string packageFilePath = Path.Combine(outputPath, packageName + PackageExtension);
+
+        int threads = Environment.ProcessorCount;
+
+        Console.WriteLine($"Writing output package in parallel using {threads} threads at: {packageFilePath}...");
+
+        try
+        {
+            using FileStream packageFileStream = File.Create(packageFilePath);
+            using ZipArchive packageWriter = new ZipArchive(packageFileStream, ZipArchiveMode.Create, false, Encoding.UTF8);
+
+            fileList.Add(new SelfUpdateAssetInfo
+            {
+                FileHash = [],
+                FilePath = "manifest.json"
+            });
+
+            int length = fileList.Count;
+            int count = 0;
+
+            Lock thisLock = new Lock();
+            Parallel.ForEach(fileList, CompressBrotliAndCreate);
+
+            return 0;
+
+            void CompressBrotliAndCreate(SelfUpdateAssetInfo asset)
+            {
+                Interlocked.Increment(ref count);
+                int currentCount = count;
+
+                string filePath = Path.Combine(outputPath, asset.FilePath);
+                DateTime lastWriteTime = File.GetLastWriteTimeUtc(filePath);
+
+                if (lastWriteTime.Year is < 1980 or > 2107)
+                    lastWriteTime = new DateTime(1980, 1, 1, 0, 0, 0);
+
+                Console.WriteLine($"  [{currentCount}/{length}] Compressing asset to buffer: {asset.FilePath}");
+                using MemoryStream compressedStream = new MemoryStream(); 
+                using BrotliStream brotliStream = new BrotliStream(compressedStream, CompressionLevel.SmallestSize);
+                using FileStream fileStream = File.OpenRead(filePath);
+
+                fileStream.CopyTo(brotliStream);
+                brotliStream.Flush();
+
+                compressedStream.Position = 0;
+
+                using (thisLock.EnterScope())
+                {
+                    Console.WriteLine($"  [{currentCount}/{length}] Compress done. Now locking and writing buffer to package for: {asset.FilePath}");
+
+                    string entryBrExt = asset.FilePath + ".br";
+                    ZipArchiveEntry entry = packageWriter.CreateEntry(entryBrExt, CompressionLevel.NoCompression);
+                    entry.LastWriteTime = lastWriteTime;
+
+                    using Stream entryStream = entry.Open();
+                    compressedStream.CopyTo(entryStream);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e);
+            return Marshal.GetHRForException(e);
+        }
+    }
+
+    private static FileInfo? FindPluginLibraryAndGetAssets(string dirPath, out List<SelfUpdateAssetInfo> fileList, out PluginManifest? referenceInfo)
     {
         DirectoryInfo directoryInfo = new DirectoryInfo(dirPath);
         List<SelfUpdateAssetInfo> fileListRef = [];
@@ -128,7 +204,7 @@ public class Program
         referenceInfo = null;
 
         FileInfo? mainLibraryFileInfo = null;
-        SelfUpdateReferenceInfo? referenceInfoResult = null;
+        PluginManifest? referenceInfoResult = null;
 
         Parallel.ForEach(directoryInfo.EnumerateFiles("*", SearchOption.AllDirectories).Where(x => !x.Name.Equals("manifest.json", StringComparison.OrdinalIgnoreCase)), Impl);
         referenceInfo = referenceInfoResult;
@@ -138,9 +214,13 @@ public class Program
         void Impl(FileInfo fileInfo)
         {
             string fileName = fileInfo.FullName.AsSpan(directoryInfo.FullName.Length).TrimStart("\\/").ToString();
+            if (fileName.EndsWith(PackageExtension, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
 
             if (mainLibraryFileInfo == null &&
-                IsPluginLibrary(fileInfo, fileName, out SelfUpdateReferenceInfo? referenceInfoInner))
+                IsPluginLibrary(fileInfo, fileName, out PluginManifest? referenceInfoInner))
             {
                 Interlocked.Exchange(ref mainLibraryFileInfo, fileInfo);
                 Interlocked.Exchange(ref referenceInfoResult, referenceInfoInner);
@@ -183,7 +263,7 @@ public class Program
     private unsafe delegate void* GetPlugin();
     private unsafe delegate GameVersion* GetVersion();
 
-    private static unsafe bool IsPluginLibrary(FileInfo fileInfo, string fileName, [NotNullWhen(true)] out SelfUpdateReferenceInfo? referenceInfo)
+    private static unsafe bool IsPluginLibrary(FileInfo fileInfo, string fileName, [NotNullWhen(true)] out PluginManifest? referenceInfo)
     {
         nint handle = nint.Zero;
         referenceInfo = null;
@@ -253,7 +333,7 @@ public class Program
             plugin.GetPluginDescription(out string? pluginDescription);
             plugin.GetPluginCreationDate(out DateTime* pluginCreationDate);
 
-            referenceInfo = new SelfUpdateReferenceInfo
+            referenceInfo = new PluginManifest
             {
                 Assets = [],
                 MainPluginName = pluginName,
@@ -262,7 +342,9 @@ public class Program
                 PluginCreationDate = *pluginCreationDate,
                 PluginVersion = pluginVersion,
                 PluginStandardVersion = pluginStandardVersion,
-                MainLibraryName = fileName
+                PluginAlternativeIcon = TryGetAlternateIconData(plugin),
+                MainLibraryName = fileName,
+                ManifestDate = DateTimeOffset.UtcNow
             };
             return true;
         }
@@ -279,5 +361,34 @@ public class Program
     {
         string? execPath = Path.GetFileName(Environment.ProcessPath);
         Console.WriteLine($"Usage: {execPath} [plugin_dll_directory_path]");
+    }
+
+    private static string? TryGetAlternateIconData(IPlugin plugin)
+    {
+        try
+        {
+            plugin.GetPluginAppIconUrl(out string? iconUrlOrData);
+            if (string.IsNullOrEmpty(iconUrlOrData))
+            {
+                return null;
+            }
+
+            if (Base64.IsValid(iconUrlOrData))
+            {
+                return iconUrlOrData;
+            }
+
+            if (!Uri.TryCreate(iconUrlOrData, UriKind.Absolute, out Uri? iconUrl))
+            {
+                return null;
+            }
+
+            return iconUrl.ToString();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error while retrieving plugin alternative icon data: {ex}");
+            return null;
+        }
     }
 }
