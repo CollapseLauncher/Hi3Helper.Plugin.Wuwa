@@ -1,8 +1,16 @@
 using System.Text.Json.Serialization;
-using Hi3Helper.Plugin.Core.Management;
-using Hi3Helper.Plugin.Core.Utility.Json.Converters;
 
 namespace Hi3Helper.Plugin.Wuwa.Management.Api;
+
+public class WuwaApiResponseGameConfigDefinition
+#if USELIGHTWEIGHTJSONPARSER
+    : IJsonElementParsable<WuwaApiResponseGameConfigDefinition>,
+      IJsonStreamParsable<WuwaApiResponseGameConfigDefinition>
+#endif
+{
+    [JsonPropertyName("config")] // default.config
+    public WuwaApiResponseGameConfigRef? ConfigReference { get; set; }
+}
 
 public class WuwaApiResponseGameConfig
 #if USELIGHTWEIGHTJSONPARSER
@@ -10,25 +18,9 @@ public class WuwaApiResponseGameConfig
       IJsonStreamParsable<WuwaApiResponseGameConfig>
 #endif
 {
-#if !USELIGHTWEIGHTJSONPARSER
-    [JsonPropertyName("version")] // default.config.version
-    [JsonConverter(typeof(Utf8SpanParsableJsonConverter<GameVersion>))]
-#endif
-    public GameVersion CurrentVersion { get; set; }
+    [JsonPropertyName("default")] // default
+    public WuwaApiResponseGameConfigDefinition? Default { get; set; }
 
-#if !USELIGHTWEIGHTJSONPARSER
-    [JsonPropertyName("patchType")] // default.config.patchType
-#endif
-    public string? PatchType { get; set; }
-
-#if !USELIGHTWEIGHTJSONPARSER
-    [JsonPropertyName("size")] // default.config.size
-    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
-    public ulong? PatchFileSize { get; set; }
-#endif
-#if !USELIGHTWEIGHTJSONPARSER
-    [JsonPropertyName("baseUrl")] // default.config.baseUrl
-    public string? BaseUrl { get; set; }
 #if !USELIGHTWEIGHTJSONPARSER
     [JsonPropertyName("keyFileCheckList")] // keyFileCheckList[2]
     public string[]? KeyFileCheckList { get; set; }
@@ -66,4 +58,3 @@ public class WuwaApiResponseGameConfig
     }
 #endif
 }
-#endif

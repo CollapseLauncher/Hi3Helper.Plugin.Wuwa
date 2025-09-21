@@ -5,8 +5,8 @@ using Hi3Helper.Plugin.Wuwa.Utils;
 using System;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using System.Net;
 using System.Net.Http;
-using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.Marshalling;
 using System.Text.Json;
 using System.Threading;
@@ -27,12 +27,17 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
     [field: AllowNull, MaybeNull]
     protected HttpClient ApiDownloadHttpClient
     {
-        get => field ??= WuwaUtils.CreateApiHttpClient(apiResponseBaseUrl, gameTag, authenticationHash, apiOptions);
+        get => field ??= new PluginHttpClientBuilder()
+            .SetAllowedDecompression(DecompressionMethods.None)
+            .AllowCookies()
+            .AllowRedirections()
+            .AllowUntrustedCert()
+            .Create();
         set;
     }
 
     protected override string ApiResponseBaseUrl { get; } = apiResponseBaseUrl;
-    private WuwaApiResponse<WuwaApiResponseMedia>? ApiResponse { get; set; }
+    private WuwaApiResponseMedia? ApiResponse { get; set; }
 
     public override void GetBackgroundEntries(out nint handle, out int count, out bool isDisposable, out bool isAllocated)
     {
@@ -44,7 +49,7 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
             {
                 ref LauncherPathEntry entry = ref backgroundEntries[0];
 
-                if (ApiResponse?.ResponseData == null)
+                if (ApiResponse == null)
                 {
                     isDisposable = false;
                     handle = nint.Zero;
@@ -53,10 +58,7 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
                     return;
                 }
 
-                unsafe
-                {
-                    entry.Write(ApiResponse.ResponseData.BackgroundImageUrl, new Span<byte>((void*)null, sizeof(ulong)));
-                }
+                entry.Write(ApiResponse.BackgroundImageUrl, Span<byte>.Empty);
                 isAllocated = true;
             }
             finally
@@ -84,16 +86,17 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
 
     protected override async Task<int> InitAsync(CancellationToken token)
     {
-        using HttpResponseMessage response = await ApiDownloadHttpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, ApiDownloadHttpClient.BaseAddress), token);
+        using HttpResponseMessage response = await ApiResponseHttpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, ApiResponseHttpClient.BaseAddress), token);
         response.EnsureSuccessStatusCode();
-        
+
 #if USELIGHTWEIGHTJSONPARSER
         await using Stream networkStream = await response.Content.ReadAsStreamAsync(token);
-        ApiResponse = await WuwaApiResponse<WuwaApiResponseMedia>.ParseFromAsync(networkStream, token: token);
+        ApiResponse = await WuwaApiResponseMedia.ParseFromAsync(networkStream, token: token);
 #else
         string jsonResponse = await response.Content.ReadAsStringAsync(token);
         SharedStatic.InstanceLogger.LogTrace("API Media response: {JsonResponse}", jsonResponse);
-        ApiResponse = JsonSerializer.Deserialize<WuwaApiResponse<WuwaApiResponseMedia>>(jsonResponse, WuwaApiResponseContext.Default.WuwaApiResponseWuwaApiResponseMedia);
+        ApiResponse = JsonSerializer.Deserialize<WuwaApiResponseMedia>(jsonResponse, WuwaApiResponseContext.Default.WuwaApiResponseMedia)
+                      ?? throw new NullReferenceException("Background Media API Returns null response!");
 #endif
         // We don't have a way to check if the API response is valid, so we assume it is valid if we reach this point.
         return 0;
@@ -102,7 +105,7 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
     protected override async Task DownloadAssetAsyncInner(HttpClient? client, string fileUrl, Stream outputStream,
         PluginDisposableMemory<byte> fileChecksum, PluginFiles.FileReadProgressDelegate? downloadProgress, CancellationToken token)
     {
-        await base.DownloadAssetAsyncInner(ApiResponseHttpClient, fileUrl, outputStream, fileChecksum, downloadProgress, token);
+        await base.DownloadAssetAsyncInner(ApiDownloadHttpClient, fileUrl, outputStream, fileChecksum, downloadProgress, token);
     }
 
     public override void Dispose()

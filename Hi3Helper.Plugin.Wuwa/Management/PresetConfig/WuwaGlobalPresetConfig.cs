@@ -84,14 +84,14 @@ public partial class WuwaGlobalPresetConfig : PluginPresetConfigBase
 
     public override IGameManager? GameManager
     {
-        get => field ??= new WuwaGameManager(ExecutableName, ApiResponseUrl, CurrentTag, Hash1);
+        get => field ??= new WuwaGameManager(ExecutableName, ApiResponseUrl, CurrentPatchHash, CurrentTag, Hash1);
         set;
     }
 
     public override IGameInstaller? GameInstaller
     {
-        get => throw new NotImplementedException();
-        set => throw new NotImplementedException();
+        get => field ??= new WuwaGameInstaller(GameManager);
+        set;
     }
     protected override Task<int> InitAsync(CancellationToken token)
     {

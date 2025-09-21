@@ -1,11 +1,8 @@
-
-
 using System;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Net.Http;
 using System.Runtime.InteropServices.Marshalling;
-using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -49,7 +46,7 @@ internal partial class WuwaGameManager : GameManagerBase
     protected string ApiOptions { get; set; }
     protected string Hash1 { get; set; }
     
-    private WuwaApiResponse<WuwaApiResponseGameConfig>? ApiGameConfigResponse { get; set; }
+    private WuwaApiResponseGameConfig? ApiGameConfigResponse { get; set; }
     // private WuwaApiResponse<WuwaApiResponseGameConfigRef>? ApiGameDownloadRefResponse { get; set; }
     private string CurrentGameExecutableByPreset { get; }
 
@@ -61,9 +58,10 @@ internal partial class WuwaGameManager : GameManagerBase
     internal bool    IsInitialized         { get; set; }
 
     internal WuwaGameManager(string gameExecutableNameByPreset,
-        string apiResponseBaseUrl, string gameTag, string hash1)
+        string apiResponseBaseUrl, string authenticationHash, string gameTag, string hash1)
     {
         CurrentGameExecutableByPreset = gameExecutableNameByPreset;
+        AuthenticationHash = authenticationHash;
         ApiResponseBaseUrl = apiResponseBaseUrl;
         GameTag = gameTag;
         Hash1 = hash1;
@@ -113,12 +111,12 @@ internal partial class WuwaGameManager : GameManagerBase
     {
         get
         {
-            if (ApiGameConfigResponse?.ResponseData == null)
+            if (ApiGameConfigResponse == null)
             {
                 return GameVersion.Empty;
             }
 
-            field = ApiGameConfigResponse.ResponseData.CurrentVersion;
+            field = ApiGameConfigResponse.Default?.ConfigReference?.CurrentVersion ?? GameVersion.Empty;
             return field;
         }
         set;
@@ -156,40 +154,39 @@ internal partial class WuwaGameManager : GameManagerBase
         configMessage.EnsureSuccessStatusCode();
 #if USELIGHTWEIGHTJSONPARSER
         await using Stream configStream = await configMessage.Content.ReadAsStreamAsync(token);
-        ApiGameConfigResponse = await WuwaApiResponse<WuwaApiResponseGameConfig>.ParseFromAsync(configStream, token: token);
+        ApiGameConfigResponse = await WuwaApiResponseGameConfig.ParseFromAsync(configStream, token: token);
 #else
         string jsonResponse = await configMessage.Content.ReadAsStringAsync(token);
         SharedStatic.InstanceLogger.LogTrace("API Game Config response: {JsonResponse}", jsonResponse);
-        var tmp = JsonSerializer.Deserialize<WuwaApiResponse<WuwaApiResponseGameConfig>>(jsonResponse);
+        var tmp = JsonSerializer.Deserialize<WuwaApiResponseGameConfig>(jsonResponse, WuwaApiResponseContext.Default.WuwaApiResponseGameConfig);
         ApiGameConfigResponse = tmp ?? throw new JsonException("Failed to deserialize API game config response.");
 
 #endif
-        ApiGameConfigResponse.EnsureSuccessCode();
         
-        if (ApiGameConfigResponse.ResponseData == null)
+        if (ApiGameConfigResponse.Default?.ConfigReference == null)
             throw new NullReferenceException("ApiGameConfigResponse.ResponseData is null");
         
-        if (ApiGameConfigResponse.ResponseData.CurrentVersion == GameVersion.Empty)
+        if (ApiGameConfigResponse.Default.ConfigReference.CurrentVersion == GameVersion.Empty)
         {
             throw new NullReferenceException("Game API Launcher cannot retrieve CurrentVersion value!");
         }
 
-        GameResourceBasisPath = ApiGameConfigResponse.ResponseData.BaseUrl;
+        GameResourceBasisPath = ApiGameConfigResponse.Default.ConfigReference.BaseUrl;
         if (GameResourceBasisPath == null)
         {
             throw new NullReferenceException("Game API Launcher cannot retrieve BaseUrl reference value!");
         }
         
-        Uri gameResourceBase = new Uri(GameResourceJsonUrl);
+        Uri gameResourceBase = new Uri(ApiResponseBaseUrl); // TODO for Cry0: Replace this as the actual base URL for the game resources from default.cdnList.url
         GameResourceBaseUrl = $"{gameResourceBase.Scheme}://{gameResourceBase.Host}";
 
         // Set API current game version
-        if (ApiGameConfigResponse.ResponseData.CurrentVersion == GameVersion.Empty)
+        if (ApiGameConfigResponse.Default.ConfigReference.CurrentVersion == GameVersion.Empty)
         {
-            throw new InvalidOperationException($"API GameConfig returns an invalid CurrentVersion data! Data: {ApiGameConfigResponse.ResponseData.CurrentVersion}");
+            throw new InvalidOperationException($"API GameConfig returns an invalid CurrentVersion data! Data: {ApiGameConfigResponse.Default.ConfigReference.CurrentVersion}");
         }
 
-        ApiGameVersion = ApiGameConfigResponse.ResponseData.CurrentVersion;
+        ApiGameVersion = ApiGameConfigResponse.Default.ConfigReference.CurrentVersion;
         IsInitialized  = true;
 
         return 0;
@@ -287,7 +284,7 @@ internal partial class WuwaGameManager : GameManagerBase
 
 #if !USELIGHTWEIGHTJSONPARSER
         CurrentGameConfigNode.SetConfigValueIfEmpty("version", CurrentGameVersion.ToString());
-        CurrentGameConfigNode.SetConfigValueIfEmpty("name", ApiGameConfigResponse?.ResponseData?.KeyFileCheckList?[2] ?? Path.GetFileNameWithoutExtension(CurrentGameExecutableByPreset));
+        CurrentGameConfigNode.SetConfigValueIfEmpty("name", ApiGameConfigResponse?.KeyFileCheckList?[2] ?? Path.GetFileNameWithoutExtension(CurrentGameExecutableByPreset));
 #endif
         if (CurrentGameVersion == GameVersion.Empty)
         {

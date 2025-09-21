@@ -2,19 +2,21 @@
 using Hi3Helper.Plugin.Core.Utility;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net;
+using System.Buffers;
+using System.Buffers.Text;
 using System.Net.Http;
 using System.Text;
-using System.Threading.Tasks;
+using System.Threading;
 
 namespace Hi3Helper.Plugin.Wuwa.Utils;
 
 internal static class WuwaUtils
 {
+    private static readonly Lock SharedLock = new();
+    private static readonly WuwaTransform CommonSharedTransform = new WuwaTransform(99);
+
     internal static HttpClient CreateApiHttpClient(string? apiBaseUrl = null, string? gameTag = null, string? authCdnToken = "", string? apiOptions = "", string? hash1 = "")
-        => CreateApiHttpClientBuilder(gameTag, authCdnToken, apiOptions, null, hash1).Create();
+        => CreateApiHttpClientBuilder(apiBaseUrl, gameTag, authCdnToken, apiOptions, hash1).Create();
 
     internal static PluginHttpClientBuilder CreateApiHttpClientBuilder(string? apiBaseUrl, string? gameTag = null, string? authCdnToken= "", string? accessOption = null, string? hash1 = "")
     {
@@ -27,10 +29,11 @@ internal static class WuwaUtils
             throw new ArgumentNullException(nameof(authCdnToken), "authCdnToken cannot be empty. Use string.Empty if you want to ignore it instead.");
         }
 
-        if (string.IsNullOrEmpty(authCdnToken))
+        if (!string.IsNullOrEmpty(authCdnToken))
         {
-            authCdnToken.Aggregate(string.Empty, (current, c) => current + (char)(c ^ 99));
-            authCdnToken = Convert.FromBase64String(authCdnToken).Aggregate(string.Empty, (current, b) => current + (char)(b ^ 99));
+            authCdnToken = authCdnToken.AeonPlsHelpMe();
+            // authCdnToken.Aggregate(string.Empty, (current, c) => current + (char)(c ^ 99));
+            // authCdnToken = Convert.FromBase64String(authCdnToken).Aggregate(string.Empty, (current, b) => current + (char)(b ^ 99));
 #if DEBUG
             SharedStatic.InstanceLogger.LogTrace("Decoded authCdnToken: {}", authCdnToken);
 #endif
@@ -39,13 +42,13 @@ internal static class WuwaUtils
         switch (accessOption)
         {
             case "news":
-                builder.SetBaseUrl(apiBaseUrl + "launcher/" + authCdnToken + "/" + gameTag + "/" + "information/en.json");
+                builder.SetBaseUrl(apiBaseUrl.CombineUrlFromString("launcher", authCdnToken, gameTag, "information", "en.json"));
                 break;
             case "bg":
-                builder.SetBaseUrl(apiBaseUrl + "launcher/" + authCdnToken + "/" + gameTag + "/background/" + hash1 + "/en.json");
+                builder.SetBaseUrl(apiBaseUrl.CombineUrlFromString("launcher", authCdnToken, gameTag, "background", hash1, "en.json"));
                 break;
             case "media":
-                builder.SetBaseUrl(apiBaseUrl + "launcher/" + gameTag + "/" + authCdnToken + "/social/en.json");
+                builder.SetBaseUrl(apiBaseUrl.CombineUrlFromString("launcher", gameTag, authCdnToken, "social", "en.json"));
                 break;
             default:
                 break;
@@ -55,13 +58,48 @@ internal static class WuwaUtils
 #if DEBUG
         SharedStatic.InstanceLogger.LogTrace("Created HttpClient with Token: {}", authCdnToken);
 #endif
-        builder.AddHeader("Host", apiBaseUrl.Substring(7, apiBaseUrl.IndexOf('/', 8) - 7)); // exclude "https://"
-        builder.AddHeader("Accept-Encoding", "gzip");
-
-        // Enforce gzip decompression for responses
-        builder.SetAllowedDecompression(DecompressionMethods.GZip);
+        string hostname = builder.HttpBaseUri?.Host ?? ""; // exclude "https://"
+        builder.AddHeader("Host", hostname);
 
         return builder;
+    }
+
+    internal static string AeonPlsHelpMe(this string whatDaDup)
+    {
+        const int amountOfBeggingForHelp = 4096;
+
+        using (SharedLock.EnterScope())
+        {
+            int bufferSize = Encoding.UTF8.GetMaxByteCount(whatDaDup.Length);
+
+            byte[]? iWannaConvene = bufferSize <= amountOfBeggingForHelp
+                ? null
+                : ArrayPool<byte>.Shared.Rent(bufferSize);
+
+            scoped Span<byte> wannaConvene = iWannaConvene ?? stackalloc byte[bufferSize];
+            try
+            {
+                bool isAsterite2Sufficient =
+                    Encoding.UTF8.TryGetBytes(whatDaDup, wannaConvene, out int amountOfCryFromBegging);
+                amountOfCryFromBegging = Base64Url.DecodeFromUtf8InPlace(wannaConvene[..amountOfCryFromBegging]);
+
+                if (!isAsterite2Sufficient || amountOfCryFromBegging == 0)
+                {
+                    throw new InvalidOperationException();
+                }
+
+                amountOfCryFromBegging = CommonSharedTransform.TransformBlockCore(wannaConvene[..amountOfCryFromBegging], wannaConvene);
+
+                return Encoding.UTF8.GetString(wannaConvene[..amountOfCryFromBegging]);
+            }
+            finally
+            {
+                if (iWannaConvene != null)
+                {
+                    ArrayPool<byte>.Shared.Return(iWannaConvene);
+                }
+            }
+        }
     }
 }
 
