@@ -1,27 +1,21 @@
-﻿using Hi3Helper.Plugin.Core;
-using Hi3Helper.Plugin.Core.Utility;
-using Microsoft.Extensions.Logging;
+﻿using Hi3Helper.Plugin.Core.Utility;
 using System;
 using System.Buffers;
 using System.Buffers.Text;
 using System.Net.Http;
 using System.Text;
-using System.Threading;
 
 namespace Hi3Helper.Plugin.Wuwa.Utils;
 
 internal static class WuwaUtils
 {
-    private static readonly Lock SharedLock = new();
-    private static readonly WuwaTransform CommonSharedTransform = new WuwaTransform(99);
-
     internal static HttpClient CreateApiHttpClient(string? apiBaseUrl = null, string? gameTag = null, string? authCdnToken = "", string? apiOptions = "", string? hash1 = "")
         => CreateApiHttpClientBuilder(apiBaseUrl, gameTag, authCdnToken, apiOptions, hash1).Create();
 
     internal static PluginHttpClientBuilder CreateApiHttpClientBuilder(string? apiBaseUrl, string? gameTag = null, string? authCdnToken= "", string? accessOption = null, string? hash1 = "")
     {
         PluginHttpClientBuilder builder = new PluginHttpClientBuilder()
-            .SetUserAgent($"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36");
+            .SetUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36");
 
         // ReSharper disable once ConvertIfStatementToSwitchStatement      
         if (authCdnToken == null)
@@ -68,36 +62,34 @@ internal static class WuwaUtils
     {
         const int amountOfBeggingForHelp = 4096;
 
-        using (SharedLock.EnterScope())
+        WuwaTransform transform = new(99);
+        int bufferSize = Encoding.UTF8.GetMaxByteCount(whatDaDup.Length);
+
+        byte[]? iWannaConvene = bufferSize <= amountOfBeggingForHelp
+            ? null
+            : ArrayPool<byte>.Shared.Rent(bufferSize);
+
+        scoped Span<byte> wannaConvene = iWannaConvene ?? stackalloc byte[bufferSize];
+        try
         {
-            int bufferSize = Encoding.UTF8.GetMaxByteCount(whatDaDup.Length);
+            bool isAsterite2Sufficient =
+                Encoding.UTF8.TryGetBytes(whatDaDup, wannaConvene, out int amountOfCryFromBegging);
+            amountOfCryFromBegging = Base64Url.DecodeFromUtf8InPlace(wannaConvene[..amountOfCryFromBegging]);
 
-            byte[]? iWannaConvene = bufferSize <= amountOfBeggingForHelp
-                ? null
-                : ArrayPool<byte>.Shared.Rent(bufferSize);
-
-            scoped Span<byte> wannaConvene = iWannaConvene ?? stackalloc byte[bufferSize];
-            try
+            if (!isAsterite2Sufficient || amountOfCryFromBegging == 0)
             {
-                bool isAsterite2Sufficient =
-                    Encoding.UTF8.TryGetBytes(whatDaDup, wannaConvene, out int amountOfCryFromBegging);
-                amountOfCryFromBegging = Base64Url.DecodeFromUtf8InPlace(wannaConvene[..amountOfCryFromBegging]);
-
-                if (!isAsterite2Sufficient || amountOfCryFromBegging == 0)
-                {
-                    throw new InvalidOperationException();
-                }
-
-                amountOfCryFromBegging = CommonSharedTransform.TransformBlockCore(wannaConvene[..amountOfCryFromBegging], wannaConvene);
-
-                return Encoding.UTF8.GetString(wannaConvene[..amountOfCryFromBegging]);
+                throw new InvalidOperationException();
             }
-            finally
+
+            amountOfCryFromBegging = transform.TransformBlockCore(wannaConvene[..amountOfCryFromBegging], wannaConvene);
+
+            return Encoding.UTF8.GetString(wannaConvene[..amountOfCryFromBegging]);
+        }
+        finally
+        {
+            if (iWannaConvene != null)
             {
-                if (iWannaConvene != null)
-                {
-                    ArrayPool<byte>.Shared.Return(iWannaConvene);
-                }
+                ArrayPool<byte>.Shared.Return(iWannaConvene);
             }
         }
     }
