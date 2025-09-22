@@ -12,6 +12,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+// ReSharper disable IdentifierTypo
 
 namespace Hi3Helper.Plugin.Wuwa.Management.Api;
 
@@ -20,7 +21,7 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
 {
     [field: AllowNull, MaybeNull]
     protected override HttpClient ApiResponseHttpClient { 
-        get => field ??= WuwaUtils.CreateApiHttpClient(apiResponseBaseUrl, gameTag, authenticationHash, apiOptions, hash1);
+        get => field ??= WuwaUtils.CreateApiHttpClient(ApiResponseBaseUrl, gameTag, authenticationHash, apiOptions, hash1);
         set;
     }
 
@@ -89,15 +90,11 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
         using HttpResponseMessage response = await ApiResponseHttpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, ApiResponseHttpClient.BaseAddress), token);
         response.EnsureSuccessStatusCode();
 
-#if USELIGHTWEIGHTJSONPARSER
-        await using Stream networkStream = await response.Content.ReadAsStreamAsync(token);
-        ApiResponse = await WuwaApiResponseMedia.ParseFromAsync(networkStream, token: token);
-#else
         string jsonResponse = await response.Content.ReadAsStringAsync(token);
         SharedStatic.InstanceLogger.LogTrace("API Media response: {JsonResponse}", jsonResponse);
         ApiResponse = JsonSerializer.Deserialize<WuwaApiResponseMedia>(jsonResponse, WuwaApiResponseContext.Default.WuwaApiResponseMedia)
                       ?? throw new NullReferenceException("Background Media API Returns null response!");
-#endif
+
         // We don't have a way to check if the API response is valid, so we assume it is valid if we reach this point.
         return 0;
     }
@@ -115,8 +112,8 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
         
         using (ThisInstanceLock.EnterScope())
         {
-            ApiResponseHttpClient?.Dispose();
-            ApiDownloadHttpClient?.Dispose();
+            ApiResponseHttpClient.Dispose();
+            ApiDownloadHttpClient.Dispose();
             
             ApiResponse = null;
             base.Dispose();

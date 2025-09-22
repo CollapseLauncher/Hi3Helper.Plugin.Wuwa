@@ -1,9 +1,12 @@
-﻿using Hi3Helper.Plugin.Core.Utility;
+﻿using Hi3Helper.Plugin.Core;
+using Hi3Helper.Plugin.Core.Utility;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Buffers;
 using System.Buffers.Text;
 using System.Net.Http;
 using System.Text;
+// ReSharper disable IdentifierTypo
 
 namespace Hi3Helper.Plugin.Wuwa.Utils;
 

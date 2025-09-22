@@ -1,5 +1,7 @@
 using Hi3Helper.Plugin.Core;
 using Hi3Helper.Plugin.Core.Management.Api;
+using Hi3Helper.Plugin.Core.Utility;
+using Hi3Helper.Plugin.Core.Utility.Json;
 using Hi3Helper.Plugin.Wuwa.Utils;
 using Microsoft.Extensions.Logging;
 using System;
@@ -7,20 +9,13 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Runtime.InteropServices.Marshalling;
 using System.Threading;
 using System.Threading.Tasks;
-using Hi3Helper.Plugin.Core.Utility;
-using System.Net;
-
+// ReSharper disable IdentifierTypo
 // ReSharper disable InconsistentNaming
-
-#if USELIGHTWEIGHTJSONPARSER
-using System.IO;
-#else
-using System.Text.Json;
-#endif
 
 namespace Hi3Helper.Plugin.Wuwa.Management.Api;
 
@@ -30,7 +25,7 @@ internal partial class WuwaGlobalLauncherApiNews(string apiResponseBaseUrl, stri
     [field: AllowNull, MaybeNull]
     protected override HttpClient ApiResponseHttpClient
     {
-        get => field ??= WuwaUtils.CreateApiHttpClient(apiResponseBaseUrl, gameTag, authenticationHash, apiOptions, hash1);
+        get => field ??= WuwaUtils.CreateApiHttpClient(ApiResponseBaseUrl, gameTag, authenticationHash, apiOptions, hash1);
         set;
     }
 
@@ -46,45 +41,124 @@ internal partial class WuwaGlobalLauncherApiNews(string apiResponseBaseUrl, stri
         set;
     }
 
-    protected override string ApiResponseBaseUrl { get; } = apiResponseBaseUrl;
-    private WuwaApiResponseSocial? SocialMediaApiResponse { get; set; }
+    protected override string                 ApiResponseBaseUrl         { get; } = apiResponseBaseUrl;
+    private            WuwaApiResponseSocial? ApiResponseSocialMedia     { get; set; }
+    private            WuwaApiResponseNews?   ApiResponseNewsAndCarousel { get; set; }
 
     protected override async Task<int> InitAsync(CancellationToken token)
     {
-        string requestUrl = ApiResponseBaseUrl
-            .CombineUrlFromString("launcher",
-                gameTag,
-                authenticationHash.AeonPlsHelpMe(),
-                "social",
-                "en.json");
+        string requestSocialUrl = ApiResponseBaseUrl
+               .CombineUrlFromString("launcher",
+                        gameTag,
+                        authenticationHash.AeonPlsHelpMe(),
+                        "social",
+                        "en.json");
 
-        using HttpResponseMessage response = await ApiResponseHttpClient.GetAsync(requestUrl, HttpCompletionOption.ResponseHeadersRead, token);
-        response.EnsureSuccessStatusCode();
-#if USELIGHTWEIGHTJSONPARSER
-        await using Stream networkStream = await response.Content.ReadAsStreamAsync(token);
-        SocialMediaResponse = await WuwaApiResponseSocial.ParseFromAsync(networkStream, token: token);
-#else
-        string jsonResponse = await response.Content.ReadAsStringAsync(token);
-        SharedStatic.InstanceLogger.LogTrace("API Social Media and News response: {JsonResponse}", jsonResponse);
-        SocialMediaApiResponse = JsonSerializer.Deserialize<WuwaApiResponseSocial>(jsonResponse, WuwaApiResponseContext.Default.WuwaApiResponseSocial)
-            ?? throw new NullReferenceException("News and Social Media API Returns null response!");
-#endif
-        
-        return !response.IsSuccessStatusCode ? (int)response.StatusCode : 0;
+        string requestNewsUrl = ApiResponseBaseUrl
+               .CombineUrlFromString("launcher",
+                        authenticationHash.AeonPlsHelpMe(),
+                        gameTag,
+                        "information",
+                        "en.json");
+
+        ApiResponseSocialMedia = await ApiResponseHttpClient
+               .GetApiResponseFromJsonAsync(
+                        requestSocialUrl,
+                        WuwaApiResponseContext.Default.WuwaApiResponseSocial,
+                        token);
+
+        ApiResponseNewsAndCarousel = await ApiResponseHttpClient
+               .GetApiResponseFromJsonAsync(
+                        requestNewsUrl,
+                        WuwaApiResponseContext.Default.WuwaApiResponseNews,
+                        token);
+
+        return 0;
     }
-    public override void GetNewsEntries(out nint handle, out int count, out bool isDisposable, out bool isAllocated)
-        => InitializeEmpty(out handle, out count, out isDisposable, out isAllocated);
 
+    public override void GetNewsEntries(out nint handle, out int count, out bool isDisposable, out bool isAllocated)
+    {
+        if (ApiResponseNewsAndCarousel?.NewsData == null)
+        {
+            InitializeEmpty(out handle, out count, out isDisposable, out isAllocated);
+            return;
+        }
+
+        int entryEventCount  = ApiResponseNewsAndCarousel.NewsData.ContentKindEvent.Contents.Length;
+        int entryNewsCount   = ApiResponseNewsAndCarousel.NewsData.ContentKindNews.Contents.Length;
+        int entryNoticeCount = ApiResponseNewsAndCarousel.NewsData.ContentKindNotice.Contents.Length;
+
+        count =  entryEventCount;
+        count += entryNewsCount;
+        count += entryNoticeCount;
+
+        if (count == 0)
+        {
+            InitializeEmpty(out handle, out count, out isDisposable, out isAllocated);
+            return;
+        }
+
+        PluginDisposableMemory<LauncherNewsEntry> memory = PluginDisposableMemory<LauncherNewsEntry>.Alloc(count);
+
+        handle       = memory.AsSafePointer();
+        isDisposable = true;
+        isAllocated  = true;
+
+        int memIndex = 0;
+        Write(ApiResponseNewsAndCarousel.NewsData.ContentKindEvent.Contents,  ref memory, ref memIndex);
+        Write(ApiResponseNewsAndCarousel.NewsData.ContentKindNews.Contents,   ref memory, ref memIndex);
+        Write(ApiResponseNewsAndCarousel.NewsData.ContentKindNotice.Contents, ref memory, ref memIndex);
+
+        return;
+
+        static void Write(Span<WuwaApiResponseNewsEntry> entriesSpan, ref PluginDisposableMemory<LauncherNewsEntry> mem, ref int memOffset)
+        {
+            for (int i = 0; i < entriesSpan.Length; i++, memOffset++)
+            {
+                ref LauncherNewsEntry unmanagedEntry = ref mem[memOffset];
+
+                WuwaApiResponseNewsEntry entry = entriesSpan[i];
+                unmanagedEntry.Write(entry.NewsTitle, null, entry.ClickUrl, entry.Date);
+            }
+        }
+    }
 
     public override void GetCarouselEntries(out nint handle, out int count, out bool isDisposable, out bool isAllocated)
-        => InitializeEmpty(out handle, out count, out isDisposable, out isAllocated);
+    {
+        if (ApiResponseNewsAndCarousel == null)
+        {
+            InitializeEmpty(out handle, out count, out isDisposable, out isAllocated);
+            return;
+        }
+
+        count = ApiResponseNewsAndCarousel.CarouselData.Length;
+        if (count == 0)
+        {
+            InitializeEmpty(out handle, out count, out isDisposable, out isAllocated);
+            return;
+        }
+
+        PluginDisposableMemory<LauncherCarouselEntry> memory = PluginDisposableMemory<LauncherCarouselEntry>.Alloc(count);
+
+        handle       = memory.AsSafePointer();
+        isDisposable = true;
+        isAllocated  = true;
+
+        Span<WuwaApiResponseCarouselEntry> entries = ApiResponseNewsAndCarousel.CarouselData;
+        for (int i = 0; i < count; i++)
+        {
+            ref LauncherCarouselEntry unmanagedEntry = ref memory[i];
+
+            unmanagedEntry.Write(entries[i].Description, entries[i].ImageUrl, entries[i].ClickUrl);
+        }
+    }
 
     public override void GetSocialMediaEntries(out nint handle, out int count, out bool isDisposable, out bool isAllocated)
     {
         try
         {
-            if (SocialMediaApiResponse?.SocialMediaEntries is null
-                || SocialMediaApiResponse.SocialMediaEntries.Count == 0)
+            if (ApiResponseSocialMedia?.SocialMediaEntries is null
+             || ApiResponseSocialMedia.SocialMediaEntries.Count == 0)
             {
                 SharedStatic.InstanceLogger.LogTrace(
                     "[WuwaGlobalLauncherApiNews::GetSocialMediaEntries] API provided no social media entries, returning empty handle.");
@@ -94,19 +168,20 @@ internal partial class WuwaGlobalLauncherApiNews(string apiResponseBaseUrl, stri
 
             List<WuwaApiResponseSocialResponse> validEntries =
             [
-                ..SocialMediaApiResponse.SocialMediaEntries
-                    .Where(x => !string.IsNullOrEmpty(x.SocialMediaName) &&
-                                !string.IsNullOrEmpty(x.ClickUrl) &&
-                                !string.IsNullOrEmpty(x.IconUrl)
-                    )
+                ..ApiResponseSocialMedia.SocialMediaEntries
+                                         .Where(x => !string.IsNullOrEmpty(x.SocialMediaName) &&
+                                                     !string.IsNullOrEmpty(x.ClickUrl) &&
+                                                     !string.IsNullOrEmpty(x.IconUrl)
+                                          )
             ];
             int entryCount = validEntries.Count;
             PluginDisposableMemory<LauncherSocialMediaEntry> memory =
                 PluginDisposableMemory<LauncherSocialMediaEntry>.Alloc(entryCount);
 
-            handle = memory.AsSafePointer();
-            count = entryCount;
+            handle       = memory.AsSafePointer();
+            count        = entryCount;
             isDisposable = true;
+            isAllocated  = true;
 
             SharedStatic.InstanceLogger.LogTrace(
                 "[WuwaGlobalLauncherApiNews::GetSocialMediaEntries] {EntryCount} entries are allocated at: 0x{Address:x8}",
@@ -114,9 +189,9 @@ internal partial class WuwaGlobalLauncherApiNews(string apiResponseBaseUrl, stri
 
             for (int i = 0; i < entryCount; i++)
             {
-                string socialMediaName = validEntries[i].SocialMediaName!;
-                string clickUrl = validEntries[i].ClickUrl!;
-                string? iconUrl = validEntries[i].IconUrl;
+                string  socialMediaName = validEntries[i].SocialMediaName!;
+                string  clickUrl        = validEntries[i].ClickUrl!;
+                string? iconUrl         = validEntries[i].IconUrl;
 
                 ref LauncherSocialMediaEntry unmanagedEntries = ref memory[i];
 
@@ -124,8 +199,6 @@ internal partial class WuwaGlobalLauncherApiNews(string apiResponseBaseUrl, stri
                 unmanagedEntries.WriteDescription(socialMediaName);
                 unmanagedEntries.WriteClickUrl(clickUrl);
             }
-
-            isAllocated = true;
         }
         catch (Exception ex)
         {
@@ -141,7 +214,7 @@ internal partial class WuwaGlobalLauncherApiNews(string apiResponseBaseUrl, stri
         await base.DownloadAssetAsyncInner(ApiDownloadHttpClient, fileUrl, outputStream, fileChecksum, downloadProgress, token);
     }
 
-    private void InitializeEmpty(out nint handle, out int count, out bool isDisposable, out bool isAllocated)
+    private static void InitializeEmpty(out nint handle, out int count, out bool isDisposable, out bool isAllocated)
     {
         handle = nint.Zero;
         count = 0;
@@ -159,7 +232,7 @@ internal partial class WuwaGlobalLauncherApiNews(string apiResponseBaseUrl, stri
             ApiDownloadHttpClient.Dispose();
             ApiResponseHttpClient = null!;
 
-            SocialMediaApiResponse = null;
+            ApiResponseSocialMedia = null;
             base.Dispose();
         }
     }
