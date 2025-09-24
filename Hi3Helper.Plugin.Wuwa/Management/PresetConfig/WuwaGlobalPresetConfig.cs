@@ -85,7 +85,13 @@ public partial class WuwaGlobalPresetConfig : PluginPresetConfigBase
     [field: AllowNull, MaybeNull]
     public override List<string> SupportedLanguages => field ??= [
         "Japanese",
-        "English"
+        "English",
+        "Chinese",
+        "Chinese (Traditional)",
+        "Korean",
+        "French",
+        "German",
+        "Spanish"
     ];
 
     public override ILauncherApiMedia? LauncherApiMedia 

@@ -176,7 +176,7 @@ internal partial class WuwaGameManager : GameManagerBase
             throw new NullReferenceException("Game API Launcher cannot retrieve BaseUrl reference value!");
 
         Uri gameResourceBase =
-            new(ApiResponseAssetUrl); // TODO for Cry0: Replace this as the actual base URL for the game resources from default.cdnList.url
+            new(ApiResponseAssetUrl);
         GameResourceBaseUrl = $"{gameResourceBase.Scheme}://{ApiResponseAssetUrl}/launcher/game/{GameTag}/{AuthenticationHash.AeonPlsHelpMe()}/index.json";
 
         // Set API current game version
