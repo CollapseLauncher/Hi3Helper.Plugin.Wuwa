@@ -1,4 +1,4 @@
-﻿using Hi3Helper.Plugin.Core;
+using Hi3Helper.Plugin.Core;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -6,7 +6,7 @@ namespace Hi3Helper.Plugin.Wuwa;
 
 public class Exports : SharedStatic
 {
-    static Exports() => Load<WuwaPlugin>(!RuntimeFeature.IsDynamicCodeCompiled ? new Core.Management.GameVersion(0, 1, 0, 3) : default); // Loads the IPlugin instance as WuwaPlugin.
+    static Exports() => Load<WuwaPlugin>(!RuntimeFeature.IsDynamicCodeCompiled ? new Core.Management.GameVersion(0, 0, 9, 0) : default); // Loads the IPlugin instance as WuwaPlugin.
 
     [UnmanagedCallersOnly(EntryPoint = "TryGetApiExport", CallConvs = [typeof(CallConvCdecl)])]
     public static unsafe int TryGetApiExport(char* exportName, void** delegateP) =>

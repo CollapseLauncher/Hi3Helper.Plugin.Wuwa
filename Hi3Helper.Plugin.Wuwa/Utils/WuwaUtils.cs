@@ -29,8 +29,6 @@ internal static class WuwaUtils
         if (!string.IsNullOrEmpty(authCdnToken))
         {
             authCdnToken = authCdnToken.AeonPlsHelpMe();
-            // authCdnToken.Aggregate(string.Empty, (current, c) => current + (char)(c ^ 99));
-            // authCdnToken = Convert.FromBase64String(authCdnToken).Aggregate(string.Empty, (current, b) => current + (char)(b ^ 99));
 #if DEBUG
             SharedStatic.InstanceLogger.LogTrace("Decoded authCdnToken: {}", authCdnToken);
 #endif
@@ -73,20 +71,75 @@ internal static class WuwaUtils
             : ArrayPool<byte>.Shared.Rent(bufferSize);
 
         scoped Span<byte> wannaConvene = iWannaConvene ?? stackalloc byte[bufferSize];
+        string resultString;
         try
         {
             bool isAsterite2Sufficient =
                 Encoding.UTF8.TryGetBytes(whatDaDup, wannaConvene, out int amountOfCryFromBegging);
-            amountOfCryFromBegging = Base64Url.DecodeFromUtf8InPlace(wannaConvene[..amountOfCryFromBegging]);
+            SharedStatic.InstanceLogger.LogDebug(
+                "[WuwaUtils::AeonPlsHelpMe] Attempting to decode string using AeonPlsHelpMe. Input: {Input}, BufferSize: {BufferSize}, IsBufferSufficient: {IsBufferSufficient}, EncodedLength: {EncodedLength}",
+                whatDaDup, wannaConvene.Length, isAsterite2Sufficient, amountOfCryFromBegging);
 
-            if (!isAsterite2Sufficient || amountOfCryFromBegging == 0)
+            // Try Base64Url decode in-place. If decode returns 0 it means input wasn't Base64Url encoded.
+            int decodedLen = 0;
+            try
             {
-                throw new InvalidOperationException();
+                decodedLen = Base64Url.DecodeFromUtf8InPlace(wannaConvene[..amountOfCryFromBegging]);
+            }
+            catch
+            {
+                // Decode routine may throw for invalid inputs on some runtimes/implementations.
+                decodedLen = 0;
             }
 
-            amountOfCryFromBegging = transform.TransformBlockCore(wannaConvene[..amountOfCryFromBegging], wannaConvene);
+            if (!isAsterite2Sufficient)
+            {
+                // Buffer wasn't large enough for encoding step; fall back to original input.
+                SharedStatic.InstanceLogger.LogError(
+                    "[WuwaUtils::AeonPlsHelpMe] Buffer too small while preparing bytes for decoding. Input: {Input}",
+                    whatDaDup);
+                resultString = whatDaDup;
+            }
+            else if (decodedLen == 0)
+            {
+                // Input is not Base64Url encoded — treat as already-decoded (plain token or URL).
+                SharedStatic.InstanceLogger.LogInformation(
+                    "[WuwaUtils::AeonPlsHelpMe] Input appears already decoded; returning original value.");
+                SharedStatic.InstanceLogger.LogDebug(
+                    "[WuwaUtils::AeonPlsHelpMe] Already-decoded input (debug): {Input}",
+                    whatDaDup);
+                resultString = whatDaDup;
+            }
+            else
+            {
+                // We have decoded bytes; apply XOR transform and return result.
+                int transformedLen = transform.TransformBlockCore(wannaConvene[..decodedLen], wannaConvene);
 
-            return Encoding.UTF8.GetString(wannaConvene[..amountOfCryFromBegging]);
+                // Log raw decoded bytes (hex) and the decoded string before sanitization to help diagnose missing characters.
+                try
+                {
+                    SharedStatic.InstanceLogger.LogTrace(
+                        "[WuwaUtils::AeonPlsHelpMe] Decoded bytes (hex): {Hex}",
+                        Convert.ToHexString(wannaConvene[..transformedLen]));
+                }
+                catch
+                {
+                    // best-effort logging only
+                }
+
+                resultString = Encoding.UTF8.GetString(wannaConvene[..transformedLen]);
+
+                SharedStatic.InstanceLogger.LogWarning(
+                    "[WuwaUtils::AeonPlsHelpMe] Successfully decoded string using AeonPlsHelpMe. Result: {Result}",
+                    resultString);
+            }
+        }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogError(
+                "[WuwaUtils::AeonPlsHelpMe] Failed to decode string using AeonPlsHelpMe. Input: {Input}. Error: {Error}",
+                whatDaDup, ex.Message);
+            resultString = whatDaDup;
         }
         finally
         {
@@ -95,6 +148,43 @@ internal static class WuwaUtils
                 ArrayPool<byte>.Shared.Return(iWannaConvene);
             }
         }
+
+        // Sanitization: remove CR/LF and trim ends first
+        string beforeSanitize = resultString;
+        string sanitized = resultString.Replace("\r", "").Replace("\n", "").Trim();
+
+        // Remove any internal whitespace (including indentation introduced by remote responses)
+        // This prevents stray spaces/newlines from breaking tokens when concatenated into URLs.
+        if (sanitized.Length > 0)
+        {
+            ReadOnlySpan<char> sspan = sanitized.AsSpan();
+            char[] buf = new char[sspan.Length];
+            int di = 0;
+            for (int i = 0; i < sspan.Length; i++)
+            {
+                if (!char.IsWhiteSpace(sspan[i]))
+                    buf[di++] = sspan[i];
+            }
+
+            if (di != sanitized.Length)
+            {
+                string removedWs = new string(buf, 0, di);
+                SharedStatic.InstanceLogger.LogInformation(
+                    "[WuwaUtils::AeonPlsHelpMe] Sanitization removed whitespace from decoded string. Before: {BeforePreview}, After: {AfterPreview}",
+                    beforeSanitize.Length <= 80 ? beforeSanitize : beforeSanitize.Substring(0, 80) + "...",
+                    removedWs.Length <= 80 ? removedWs : removedWs.Substring(0, 80) + "...");
+                sanitized = removedWs;
+            }
+        }
+
+        if (sanitized.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            sanitized = sanitized.Substring("http://".Length);
+        else if (sanitized.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            sanitized = sanitized.Substring("https://".Length);
+
+        sanitized = sanitized.TrimEnd('/');
+
+        return sanitized;
     }
 }
 

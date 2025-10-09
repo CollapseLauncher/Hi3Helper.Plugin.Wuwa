@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<TargetFramework>net9.0</TargetFramework>
@@ -18,7 +18,7 @@
 		<Company>Collapse Launcher Team</Company>
 		<Authors>$(Company). neon-nyan, Cry0, bagusnl, shatyuka, gablm.</Authors>
 		<Copyright>Copyright 2022-2025 $(Company)</Copyright>
-		<Version>0.1.1</Version>
+		<Version>0.0.9</Version>
 		<ApplicationIcon>icon.ico</ApplicationIcon>
         <Configurations>Debug;Release</Configurations>
     </PropertyGroup>
