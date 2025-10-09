@@ -46,16 +46,12 @@ internal readonly struct WuwaTransform(byte secret) : ICryptoTransform
         }
 
     Start:
-        // Load -> Compare Mask -> XOR All
+        // Load -> XOR All
         Vector256<byte> inputVecP = Vector256.Load(inputBufferP + offset);
-        Vector256<byte> cmp       = Avx2.CompareEqual(inputVecP, MaskVector256);
         Vector256<byte> xor       = Avx2.Xor(inputVecP, SecretVector256);
 
-        // Exclude '\n' from result vector with Blend
-        Vector256<byte> result = Avx2.BlendVariable(xor, inputVecP, cmp);
-
         // Write and advance to the next data
-        Unsafe.WriteUnaligned(ref outputBufferP[offset], result);
+        Unsafe.WriteUnaligned(ref outputBufferP[offset], xor);
         offset += Vector256<byte>.Count;
 
         if (offset <= length - Vector256<byte>.Count)
@@ -73,16 +69,12 @@ internal readonly struct WuwaTransform(byte secret) : ICryptoTransform
         }
 
     Start:
-        // Load -> Compare Mask -> XOR All
+        // Load -> XOR All
         Vector128<byte> inputVecP = Vector128.Load(inputBufferP + offset);
-        Vector128<byte> cmp       = Sse2.CompareEqual(inputVecP, MaskVector128);
         Vector128<byte> xor       = Sse2.Xor(inputVecP, SecretVector128);
 
-        // Exclude '\n' from result vector. Sse2 doesn't have BlendVariable, so we use And + AndNot + Or
-        Vector128<byte> result = Sse2.Or(Sse2.And(cmp, inputVecP), Sse2.AndNot(cmp, xor));
-
         // Write and advance to the next data
-        Unsafe.WriteUnaligned(ref outputBufferP[offset], result);
+        Unsafe.WriteUnaligned(ref outputBufferP[offset], xor);
         offset += Vector128<byte>.Count;
 
         if (offset <= length - Vector128<byte>.Count)
@@ -104,12 +96,8 @@ internal readonly struct WuwaTransform(byte secret) : ICryptoTransform
 
         for (; offset < length; offset++)
         {
-            byte b = inputBuffer[offset];
-            if (b != 10)
-            {
-                b ^= secret;
-            }
-            outputBuffer[offset] = b;
+            // Always XOR every byte to recover original data
+            outputBuffer[offset] = (byte)(inputBuffer[offset] ^ secret);
         }
 
         return offset;
@@ -119,7 +107,7 @@ internal readonly struct WuwaTransform(byte secret) : ICryptoTransform
     {
         if (inputCount == 0)
         {
-            return [];
+            return Array.Empty<byte>();
         }
         byte[] array = new byte[inputCount];
         TransformBlock(inputBuffer, inputOffset, inputCount, array, 0);
