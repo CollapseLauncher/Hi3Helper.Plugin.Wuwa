@@ -87,17 +87,42 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
 
     protected override async Task<int> InitAsync(CancellationToken token)
     {
-        using HttpResponseMessage response = await ApiResponseHttpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, ApiResponseHttpClient.BaseAddress), token);
-        response.EnsureSuccessStatusCode();
+		// Resolve request URL: prefer HttpClient.BaseAddress if set, otherwise fallback to ApiResponseBaseUrl
+		string requestUrl = ApiResponseHttpClient?.BaseAddress?.ToString() ?? ApiResponseBaseUrl;
+#if DEBUG
+        SharedStatic.InstanceLogger.LogDebug("[WuwaGlobalLauncherApiMedia::InitAsync] Requesting media URL: {RequestUrl}", requestUrl);
+#endif
+		using HttpResponseMessage response = await ApiResponseHttpClient!.GetAsync(requestUrl, token);
 
-        string jsonResponse = await response.Content.ReadAsStringAsync(token);
-        SharedStatic.InstanceLogger.LogTrace("API Media response: {JsonResponse}", jsonResponse);
-        ApiResponse = JsonSerializer.Deserialize<WuwaApiResponseMedia>(jsonResponse, WuwaApiResponseContext.Default.WuwaApiResponseMedia)
-                      ?? throw new NullReferenceException("Background Media API Returns null response!");
+		// Log status and body on failure to aid debugging (but avoid reading unnecessarily on success)
+		if (!response.IsSuccessStatusCode)
+		{
+			string body = string.Empty;
+			try
+			{
+				body = await response.Content.ReadAsStringAsync(token);
+			}
+			catch (Exception ex)
+			{
+				SharedStatic.InstanceLogger.LogError(ex, "[WuwaGlobalLauncherApiMedia::InitAsync] Failed to read response body.");
+            }
+#if DEBUG
+			SharedStatic.InstanceLogger.LogError(
+				"[WuwaGlobalLauncherApiMedia::InitAsync] Request to {RequestUrl} failed with status {StatusCode}. Response body: {ResponseBody}",
+				requestUrl, (int)response.StatusCode, body);
+#endif
+		}
 
-        // We don't have a way to check if the API response is valid, so we assume it is valid if we reach this point.
-        return 0;
-    }
+		response.EnsureSuccessStatusCode();
+
+		string jsonResponse = await response.Content.ReadAsStringAsync(token);
+		SharedStatic.InstanceLogger.LogTrace("API Media response: {JsonResponse}", jsonResponse);
+		ApiResponse = JsonSerializer.Deserialize<WuwaApiResponseMedia>(jsonResponse, WuwaApiResponseContext.Default.WuwaApiResponseMedia)
+					  ?? throw new NullReferenceException("Background Media API Returns null response!");
+
+		// We don't have a way to check if the API response is valid, so we assume it is valid if we reach this point.
+		return 0;
+	}
 
     protected override async Task DownloadAssetAsyncInner(HttpClient? client, string fileUrl, Stream outputStream,
         PluginDisposableMemory<byte> fileChecksum, PluginFiles.FileReadProgressDelegate? downloadProgress, CancellationToken token)
