@@ -248,11 +248,11 @@ internal partial class WuwaGameManager : GameManagerBase
                     if (parentPath == null)
                         continue;
 
-                    string jsonPath = Path.Combine(parentPath, "launcherDownloadConfig.json");
+                    string jsonPath = Path.Combine(parentPath, "app-game-config.json");
                     if (File.Exists(jsonPath))
                     {
 #if DEBUG
-                    SharedStatic.InstanceLogger.LogTrace("Found launcherDownloadConfig.json at: {JsonPath}", jsonPath);
+                    SharedStatic.InstanceLogger.LogTrace("Found app-game-config.json at: {JsonPath}", jsonPath);
 #endif
                         return parentPath;
                     }
@@ -304,13 +304,13 @@ internal partial class WuwaGameManager : GameManagerBase
             return;
         }
 
-        string filePath = Path.Combine(CurrentGameInstallPath, "launcherDownloadConfig.json");
+        string filePath = Path.Combine(CurrentGameInstallPath, "app-game-config.json");
         FileInfo fileInfo = new(filePath);
 
         if (!fileInfo.Exists)
         {
             SharedStatic.InstanceLogger.LogWarning(
-				"[WuwaGameManager::LoadConfig] File launcherDownloadConfig.json doesn't exist on dir: {Dir}",
+				"[WuwaGameManager::LoadConfig] File app-game-config.json doesn't exist on dir: {Dir}",
                 CurrentGameInstallPath);
             return;
         }
@@ -324,13 +324,13 @@ internal partial class WuwaGameManager : GameManagerBase
             CurrentGameConfigNode = JsonNode.Parse(fileStream) as JsonObject ?? new JsonObject();
 #endif
             SharedStatic.InstanceLogger.LogTrace(
-				"[WuwaGameManager::LoadConfig] Loaded launcherDownloadConfig.json from directory: {Dir}",
+				"[WuwaGameManager::LoadConfig] Loaded app-game-config.json from directory: {Dir}",
                 CurrentGameInstallPath);
         }
         catch (Exception ex)
         {
             SharedStatic.InstanceLogger.LogError(
-				"[WuwaGameManager::LoadConfig] Cannot load launcherDownloadConfig.json! Reason: {Exception}", ex);
+				"[WuwaGameManager::LoadConfig] Cannot load app-game-config.json! Reason: {Exception}", ex);
         }
     }
 
