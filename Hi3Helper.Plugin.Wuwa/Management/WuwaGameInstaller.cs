@@ -14,6 +14,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Buffers;
+using System.Linq;
 
 namespace Hi3Helper.Plugin.Wuwa.Management;
 
@@ -121,431 +122,488 @@ partial class WuwaGameInstaller : GameInstallerBase
         }
     }
 
-    /// <summary>
-    /// Start install: downloads indexFile.json, iterates entries and downloads each resource.
-    /// Supports chunked resources via HTTP Range requests when chunkInfos are present.
-    /// Writes files under the current install path (GameManager.SetGamePath expected to be set).
-    /// Reports progress through provided delegates.
-    /// </summary>
-    protected override async Task StartInstallAsyncInner(InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
-    {
-        SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Starting installation routine.");
+	// Changes: improved TotalCountToDownload calculation and added diagnostic logging before emitting initial progress.
+	protected override async Task StartInstallAsyncInner(InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
+	{
+		SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Starting installation routine.");
 
-        if (GameAssetBaseUrl is null)
-        {
-            SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] GameAssetBaseUrl is null, aborting.");
-            throw new InvalidOperationException("Game asset base URL is not initialized.");
-        }
+		if (GameAssetBaseUrl is null)
+		{
+			SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] GameAssetBaseUrl is null, aborting.");
+			throw new InvalidOperationException("Game asset base URL is not initialized.");
+		}
 
-        // Ensure initialization (loads API/game config)
-        await InitAsync(token).ConfigureAwait(false);
+		// Ensure initialization (loads API/game config)
+		await InitAsync(token).ConfigureAwait(false);
 
-        // Download index JSON (use cached)
-        WuwaApiResponseResourceIndex? index = await GetCachedIndexAsync(false, token).ConfigureAwait(false);
-        if (index?.Resource == null || index.Resource.Length == 0)
-        {
-            SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] Resource index is empty, aborting install.");
-            throw new InvalidOperationException("Resource index is empty.");
-        }
+		// Download index JSON (use cached, but force refresh on first failure)
+		WuwaApiResponseResourceIndex? index = await GetCachedIndexAsync(false, token).ConfigureAwait(false);
 
-        SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Resource index loaded. Entries: {Count}", index.Resource.Length);
+		// If cached index is empty/null, try a forced refresh and provide detailed logs
+		if (index?.Resource == null || index.Resource.Length == 0)
+		{
+			SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Cached index empty (entries={Count}). Forcing refresh from: {Url}", index?.Resource?.Length ?? -1, GameAssetBaseUrl);
+			try
+			{
+				index = await GetCachedIndexAsync(true, token).ConfigureAwait(false);
+				SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Forced index refresh result: entries={Count}", index?.Resource?.Length ?? -1);
+			}
+			catch (Exception ex)
+			{
+				SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] Forced index refresh failed: {Err}", ex.Message);
+				throw new InvalidOperationException($"Resource index is empty and forced refresh failed. See logs for details. URL={GameAssetBaseUrl}", ex);
+			}
 
-        string? installPath = null;
-        GameManager.GetGamePath(out installPath);
+			if (index?.Resource == null || index.Resource.Length == 0)
+			{
+				SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] Resource index is empty even after forced refresh. URL={Url}", GameAssetBaseUrl);
+				throw new InvalidOperationException("Resource index is empty.");
+			}
+		}
 
-        if (string.IsNullOrEmpty(installPath))
-        {
-            SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] Install path isn't set, aborting.");
-            throw new InvalidOperationException("Game install path isn't set.");
-        }
+		SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Resource index loaded. Entries: {Count}", index.Resource.Length);
 
-        SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Install path: {Path}", installPath);
+		string? installPath = null;
+		GameManager.GetGamePath(out installPath);
 
-        // Base URI for resources: GameAssetBaseUrl typically ends with indexFile.json
-        Uri baseUri = new(GameAssetBaseUrl, UriKind.Absolute);
-        string baseDirectory = baseUri.GetLeftPart(UriPartial.Path);
-        // remove the index file part to get the directory
-        int lastSlash = baseDirectory.LastIndexOf('/');
-        if (lastSlash >= 0)
-            baseDirectory = baseDirectory.Substring(0, lastSlash + 1);
+		if (string.IsNullOrEmpty(installPath))
+		{
+			SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] Install path isn't set, aborting.");
+			throw new InvalidOperationException("Game install path isn't set.");
+		}
 
-        SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Base directory for resources: {BaseDir}", baseDirectory);
+		SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Install path: {Path}", installPath);
 
-        long totalBytesToDownload = 0;
-        foreach (var r in index.Resource)
-            totalBytesToDownload += (long)(r?.Size ?? 0);
+		// Base URI for resources: GameAssetBaseUrl typically ends with indexFile.json
+		Uri baseUri = new(GameAssetBaseUrl, UriKind.Absolute);
+		string baseDirectory = baseUri.GetLeftPart(UriPartial.Path);
+		// remove the index file part to get the directory
+		int lastSlash = baseDirectory.LastIndexOf('/');
+		if (lastSlash >= 0)
+			baseDirectory = baseDirectory.Substring(0, lastSlash + 1);
 
-        SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Total bytes to download (sum of index sizes): {TotalBytes}", totalBytesToDownload);
+		SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Base directory for resources: {BaseDir}", baseDirectory);
 
-        // Calculate initial downloaded bytes from disk to ensure UI sees meaningful values immediately.
-        long downloadedBytes = 0;
-        try
-        {
-            downloadedBytes = await CalculateDownloadedBytesAsync(token).ConfigureAwait(false);
-            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Initial downloaded bytes from disk: {DownloadedBytes}", downloadedBytes);
-        }
-        catch (Exception ex)
-        {
-            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Failed to compute initial downloaded bytes: {Err}", ex.Message);
-            downloadedBytes = 0;
-        }
+		long totalBytesToDownload = 0;
+		foreach (var r in index.Resource)
+			totalBytesToDownload += (long)(r?.Size ?? 0);
 
-        // Avoid reporting >100%: clamp to totalBytesToDownload (if known)
-        if (totalBytesToDownload > 0 && downloadedBytes > totalBytesToDownload)
-        {
-            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Downloaded bytes on disk ({Disk}) exceed index total ({Index}). Clamping reported downloaded bytes.", downloadedBytes, totalBytesToDownload);
-            downloadedBytes = totalBytesToDownload;
-        }
+		SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Total bytes to download (sum of index sizes): {TotalBytes}", totalBytesToDownload);
 
-        // Compute how many entries are actually downloadable (non-null + have a Dest).
-        int totalCountToDownload = 0;
-        foreach (var e in index.Resource)
-        {
-            if (e != null && !string.IsNullOrEmpty(e.Dest))
-                totalCountToDownload++;
-        }
+		// Calculate initial downloaded bytes from disk to ensure UI sees meaningful values immediately.
+		long downloadedBytes = 0;
+		try
+		{
+			downloadedBytes = await CalculateDownloadedBytesAsync(token).ConfigureAwait(false);
+			SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Initial downloaded bytes from disk: {DownloadedBytes}", downloadedBytes);
+		}
+		catch (Exception ex)
+		{
+			SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Failed to compute initial downloaded bytes: {Err}", ex.Message);
+			downloadedBytes = 0;
+		}
 
-        // Compute how many files are already present and valid (to seed the file counter).
-        // IMPORTANT: avoid expensive MD5 hashing on large files during seeding to prevent long blocking.
-        int alreadyDownloadedCount = 0;
-        try
-        {
-            // If MD5 validation is required during seeding, only compute for small files.
-            const long Md5CheckSizeThreshold = 50L * 1024L * 1024L; // 50 MB
+		// Avoid reporting >100%: clamp to totalBytesToDownload (if known)
+		if (totalBytesToDownload > 0 && downloadedBytes > totalBytesToDownload)
+		{
+			SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Downloaded bytes on disk ({Disk}) exceed index total ({Index}). Clamping reported downloaded bytes.", downloadedBytes, totalBytesToDownload);
+			downloadedBytes = totalBytesToDownload;
+		}
 
-            foreach (var e in index.Resource)
-            {
-                token.ThrowIfCancellationRequested();
-                if (e == null || string.IsNullOrEmpty(e.Dest))
-                    continue;
+		// Compute how many entries are actually downloadable (non-null + have a Dest).
+		// Use a simple, permissive predicate: count any entry with a non-empty Dest.
+		int totalCountToDownload = 0;
+		try
+		{
+			foreach (var e in index.Resource)
+			{
+				if (e == null)
+					continue;
 
-                string relativePath = e.Dest.Replace('/', Path.DirectorySeparatorChar);
-                string outputPath = Path.Combine(installPath, relativePath);
+				string? dest = e.Dest;
+				if (string.IsNullOrWhiteSpace(dest))
+					continue;
 
-                if (!File.Exists(outputPath))
-                    continue;
+				// Count it as a downloadable entry; validation/download flow will handle directories/invalid dests.
+				totalCountToDownload++;
+			}
+		}
+		catch (Exception ex)
+		{
+			SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Error while computing TotalCountToDownload: {Err}", ex.Message);
+		}
 
-                try
-                {
-                    var fi = new FileInfo(outputPath);
+		// Compute how many files are already present and valid (to seed the file counter).
+		// Track the set of paths we considered "already downloaded" so we don't double-count later.
+		var seededPaths = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		int alreadyDownloadedCount = 0;
+		try
+		{
+			const long Md5CheckSizeThreshold = 50L * 1024L * 1024L; // 50 MB
 
-                    // Prefer size comparison (very fast) if size info present in index.
-                    if (e.Size > 0)
-                    {
-                        if (fi.Length == (long)e.Size)
-                        {
-                            alreadyDownloadedCount++;
-                            continue;
-                        }
-                        else
-                        {
-                            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Size mismatch for seeding: {Path} (disk={Disk}, index={Index})", outputPath, fi.Length, e.Size);
-                            continue;
-                        }
-                    }
+			foreach (var e in index.Resource)
+			{
+				token.ThrowIfCancellationRequested();
+				if (e == null || string.IsNullOrEmpty(e.Dest))
+					continue;
 
-                    // If no size but MD5 is provided and file is reasonably small, compute MD5.
-                    if (!string.IsNullOrEmpty(e.Md5) && fi.Length <= Md5CheckSizeThreshold)
-                    {
-                        using var fs = File.OpenRead(outputPath);
-                        string fileMd5 = ComputeMD5Hex(fs);
-                        if (string.Equals(fileMd5, e.Md5, StringComparison.OrdinalIgnoreCase))
-                        {
-                            alreadyDownloadedCount++;
-                            continue;
-                        }
-                        else
-                        {
-                            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] MD5 mismatch during seeding: {Path}", outputPath);
-                            continue;
-                        }
-                    }
+				string relativePath = e.Dest.Replace('/', Path.DirectorySeparatorChar);
+				string outputPath = Path.Combine(installPath, relativePath);
 
-                    // No reliable quick check possible (either no size, MD5 too expensive, or MD5 missing).
-                    // Treat as not downloaded so installer will (re)validate/download it.
-                }
-                catch (Exception ex)
-                {
-                    SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Error while checking existing file during seeding: {Err}", ex.Message);
-                    // ignore individual file errors
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // if cancelled while seeding counts, proceed with what we have
-        }
+				if (!File.Exists(outputPath))
+					continue;
 
-        // Prepare an InstallProgress instance and set deterministic initial values
-        InstallProgress installProgress = default;
-        installProgress.DownloadedCount = alreadyDownloadedCount;
-        installProgress.TotalCountToDownload = totalCountToDownload;
-        installProgress.DownloadedBytes = downloadedBytes;
-        installProgress.TotalBytesToDownload = totalBytesToDownload;
+				try
+				{
+					var fi = new FileInfo(outputPath);
 
-        // Send an initial progress/state update so UI sees non-zero totals immediately.
-        try
-        {
-            progressStateDelegate?.Invoke(InstallProgressState.Preparing);
-        }
-        catch
-        {
-            // Swallow to avoid crashes; UI may be incompatible on some hosts.
-        }
+					// Prefer size comparison (very fast) if size info present in index.
+					if (e.Size > 0)
+					{
+						if (fi.Length == (long)e.Size)
+						{
+							alreadyDownloadedCount++;
+							seededPaths.Add(outputPath);
+							continue;
+						}
+						else
+						{
+							SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Size mismatch for seeding: {Path} (disk={Disk}, index={Index})", outputPath, fi.Length, e.Size);
+							continue;
+						}
+					}
 
-        try
-        {
-            progressDelegate?.Invoke(in installProgress);
-        }
-        catch
-        {
-            // Swallow to avoid crashes; at least internal state is initialized now.
-        }
+					// If no size but MD5 is provided and file is reasonably small, compute MD5.
+					if (!string.IsNullOrEmpty(e.Md5) && fi.Length <= Md5CheckSizeThreshold)
+					{
+						using var fs = File.OpenRead(outputPath);
+						string fileMd5 = ComputeMD5Hex(fs);
+						if (string.Equals(fileMd5, e.Md5, StringComparison.OrdinalIgnoreCase))
+						{
+							alreadyDownloadedCount++;
+							seededPaths.Add(outputPath);
+							continue;
+						}
+						else
+						{
+							SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] MD5 mismatch during seeding: {Path}", outputPath);
+							continue;
+						}
+					}
 
-        // helper callback used by download helpers to report byte increments
-        void OnBytesWritten(long delta)
-        {
-            // delta can be negative in some validation scenarios (not used here) but keep handling generic
-            if (delta != 0)
-            {
-                downloadedBytes += delta;
+					// No reliable quick check possible (either no size, MD5 too expensive, or MD5 missing).
+					// Treat as not downloaded so installer will (re)validate/download it.
+				}
+				catch (Exception ex)
+				{
+					SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Error while checking existing file during seeding: {Err}", ex.Message);
+					// ignore individual file errors
+				}
+			}
+		}
+		catch (OperationCanceledException)
+		{
+			// if cancelled while seeding counts, proceed with what we have
+		}
 
-                // Keep reported downloaded bytes within the index total to avoid showing >100%
-                long reportedBytes = downloadedBytes;
-                if (totalBytesToDownload > 0 && reportedBytes > totalBytesToDownload)
-                    reportedBytes = totalBytesToDownload;
+		// diagnostic log to help troubleshoot 0/0 case
+		SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Seeding counts: TotalCountToDownload={TotalCount}, AlreadyDownloadedCount={Already}, IndexEntries={IndexEntries}",
+			totalCountToDownload, alreadyDownloadedCount, index.Resource.Length);
 
-                try
-                {
-                    installProgress.DownloadedBytes = reportedBytes;
-                    installProgress.TotalBytesToDownload = totalBytesToDownload;
-                    progressDelegate?.Invoke(in installProgress);
-                }
-                catch
-                {
-                    // Swallow delegate errors to avoid crashing the installer.
-                }
-            }
-        }
+		// Prepare an InstallProgress instance and set deterministic initial values
+		InstallProgress installProgress = default;
+		installProgress.DownloadedCount = alreadyDownloadedCount;
+		installProgress.TotalCountToDownload = totalCountToDownload;
+		installProgress.DownloadedBytes = downloadedBytes;
+		installProgress.TotalBytesToDownload = totalBytesToDownload;
 
-        foreach (var entry in index.Resource)
-        {
-            token.ThrowIfCancellationRequested();
+		// Send an initial progress/state update so UI sees non-zero totals immediately.
+		try
+		{
+			progressStateDelegate?.Invoke(InstallProgressState.Preparing);
+		}
+		catch
+		{
+			// Swallow to avoid crashes; UI may be incompatible on some hosts.
+		}
 
-            if (entry == null || string.IsNullOrEmpty(entry.Dest))
-            {
-                SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Skipping null or empty entry.");
-                continue;
-            }
+		try
+		{
+			progressDelegate?.Invoke(in installProgress);
+		}
+		catch
+		{
+			// Swallow to avoid crashes; at least internal state is initialized now.
+		}
 
-            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Processing entry: Dest={Dest}, Size={Size}, Md5={Md5}, Chunks={Chunks}",
-                entry.Dest, entry.Size, entry.Md5, entry.ChunkInfos?.Length ?? 0);
+		// helper callback used by download helpers to report byte increments
+		void OnBytesWritten(long delta)
+		{
+			// delta can be negative in some validation scenarios (not used here) but keep handling generic
+			if (delta != 0)
+			{
+				downloadedBytes += delta;
 
-            string relativePath = entry.Dest.Replace('/', Path.DirectorySeparatorChar);
-            string outputPath = Path.Combine(installPath, relativePath);
-            string? parentDir = Path.GetDirectoryName(outputPath);
-            if (!string.IsNullOrEmpty(parentDir) && !Directory.Exists(parentDir))
-            {
-                SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Creating directory: {Dir}", parentDir);
-                Directory.CreateDirectory(parentDir);
-            }
+				// Keep reported downloaded bytes within the index total to avoid showing >100%
+				long reportedBytes = downloadedBytes;
+				if (totalBytesToDownload > 0 && reportedBytes > totalBytesToDownload)
+					reportedBytes = totalBytesToDownload;
 
-            // Check existing file before starting download
-            bool skipBecauseValid = false;
-            if (File.Exists(outputPath))
-            {
-                try
-                {
-                    var fi = new FileInfo(outputPath);
-                    SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] File exists: {File} (len={Len})", outputPath, fi.Length);
+				try
+				{
+					installProgress.DownloadedBytes = reportedBytes;
+					installProgress.TotalBytesToDownload = totalBytesToDownload;
+					progressDelegate?.Invoke(in installProgress);
+				}
+				catch
+				{
+					// Swallow delegate errors to avoid crashing the installer.
+				}
+			}
+		}
 
-                    // Prefer quick size check if index has it
-                    if (entry.Size > 0)
-                    {
-                        if (fi.Length == (long)entry.Size)
-                            skipBecauseValid = true;
-                        else
-                            SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Existing file size mismatch; re-downloading: {Dest}", entry.Dest);
-                    }
-                    else if (!string.IsNullOrEmpty(entry.Md5))
-                    {
-                        // Only compute MD5 for reasonably small files to avoid long blocks
-                        const long Md5CheckSizeThreshold = 50L * 1024L * 1024L; // 50 MB
-                        if (fi.Length <= Md5CheckSizeThreshold)
-                        {
-                            using var fs = File.OpenRead(outputPath);
-                            string currentMd5 = ComputeMD5Hex(fs);
-                            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Existing file md5={Md5Existing}, expected={Md5Expected}", currentMd5, entry.Md5);
+		foreach (var entry in index.Resource)
+		{
+			token.ThrowIfCancellationRequested();
 
-                            if (string.Equals(currentMd5, entry.Md5, StringComparison.OrdinalIgnoreCase))
-                                skipBecauseValid = true;
-                            else
-                                SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Existing file md5 mismatch; re-downloading: {Dest}", entry.Dest);
-                        }
-                        else
-                        {
-                            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Skipping MD5 validation for large existing file during runtime: {File}", outputPath);
-                            // Treat as not valid -> re-download to be safe (avoids blocking)
-                        }
-                    }
-                    // else: no md5 and unknown size -> treat as not valid (re-download)
-                }
-                catch (Exception ex)
-                {
-                    SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Error while checking existing file: {Err}", ex.Message);
-                    // fallback to re-download
-                }
-            }
+			if (entry == null || string.IsNullOrEmpty(entry.Dest))
+			{
+				SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Skipping null or empty entry.");
+				continue;
+			}
 
-            if (skipBecauseValid)
-            {
-                // already counted when seeding, but still update bytes/progress
-                try
-                {
-                    installProgress.DownloadedBytes = downloadedBytes > totalBytesToDownload && totalBytesToDownload > 0 ? totalBytesToDownload : downloadedBytes;
-                    installProgress.TotalBytesToDownload = totalBytesToDownload;
-                    progressDelegate?.Invoke(in installProgress);
-                }
-                catch { }
+			SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Processing entry: Dest={Dest}, Size={Size}, Md5={Md5}, Chunks={Chunks}",
+				entry.Dest, entry.Size, entry.Md5, entry.ChunkInfos?.Length ?? 0);
 
-                SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Skipping entry (already valid): {Dest}", entry.Dest);
-                continue;
-            }
+			string relativePath = entry.Dest.Replace('/', Path.DirectorySeparatorChar);
+			string outputPath = Path.Combine(installPath, relativePath);
+			string? parentDir = Path.GetDirectoryName(outputPath);
+			if (!string.IsNullOrEmpty(parentDir) && !Directory.Exists(parentDir))
+			{
+				SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Creating directory: {Dir}", parentDir);
+				Directory.CreateDirectory(parentDir);
+			}
 
-            // Signal state for currently downloading this entry (do not increment downloaded count yet)
-            try
-            {
-                progressStateDelegate?.Invoke(InstallProgressState.Download);
-                progressDelegate?.Invoke(in installProgress);
-            }
-            catch
-            {
-                // ignore delegate invocation errors
-            }
+			// Check existing file before starting download
+			bool skipBecauseValid = false;
+			if (File.Exists(outputPath))
+			{
+				try
+				{
+					var fi = new FileInfo(outputPath);
+					SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] File exists: {File} (len={Len})", outputPath, fi.Length);
 
-            // Download either as whole file or by chunks
-            if (entry.ChunkInfos == null || entry.ChunkInfos.Length == 0)
-            {
-                // whole file
-                Uri fileUri = new Uri(new Uri(baseDirectory), entry.Dest);
-                SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Downloading whole file. URI: {Uri}", fileUri);
-                await DownloadWholeFileAsync(fileUri, outputPath, token, OnBytesWritten).ConfigureAwait(false);
-                SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Downloaded file: {Path}", outputPath);
-            }
-            else
-            {
-                // chunked: stream into a temp file and append chunks
-                Uri fileUri = new Uri(new Uri(baseDirectory), entry.Dest);
-                SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Downloading chunked file. URI: {Uri}, Chunks: {Chunks}", fileUri, entry.ChunkInfos.Length);
-                await DownloadChunkedFileAsync(fileUri, outputPath, entry.ChunkInfos, token, OnBytesWritten).ConfigureAwait(false);
-                SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Downloaded chunked file: {Path}", outputPath);
-            }
+					// Prefer quick size check if index has it
+					if (entry.Size > 0)
+					{
+						if (fi.Length == (long)entry.Size)
+							skipBecauseValid = true;
+						else
+							SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Existing file size mismatch; re-downloading: {Dest}", entry.Dest);
+					}
+					else if (!string.IsNullOrEmpty(entry.Md5))
+					{
+						// Only compute MD5 for reasonably small files to avoid long blocks
+						const long Md5CheckSizeThreshold = 50L * 1024L * 1024L; // 50 MB
+						if (fi.Length <= Md5CheckSizeThreshold)
+						{
+							using var fs = File.OpenRead(outputPath);
+							string currentMd5 = ComputeMD5Hex(fs);
+							SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Existing file md5={Md5Existing}, expected={Md5Expected}", currentMd5, entry.Md5);
 
-            // Verify MD5 if provided
-            if (!string.IsNullOrEmpty(entry.Md5))
-            {
-                try
-                {
-                    using var fsVerify = File.OpenRead(outputPath);
-                    string md5 = ComputeMD5Hex(fsVerify);
-                    if (!string.Equals(md5, entry.Md5, StringComparison.OrdinalIgnoreCase))
-                    {
-                        SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] MD5 mismatch for {Dest}. Expected {Expected}, got {Got}", entry.Dest, entry.Md5, md5);
-                        throw new InvalidOperationException($"MD5 mismatch for {entry.Dest}: expected {entry.Md5}, got {md5}");
-                    }
+							if (string.Equals(currentMd5, entry.Md5, StringComparison.OrdinalIgnoreCase))
+								skipBecauseValid = true;
+							else
+								SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Existing file md5 mismatch; re-download: {Dest}", entry.Dest);
+						}
+						else
+						{
+							SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Skipping MD5 validation for large existing file during runtime: {File}", outputPath);
+							// Treat as not valid -> re-download to be safe (avoids blocking)
+						}
+					}
+					// else: no md5 and unknown size -> treat as not valid (re-download)
+				}
+				catch (Exception ex)
+				{
+					SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Error while checking existing file: {Err}", ex.Message);
+					// fallback to re-download
+				}
+			}
 
-                    SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] MD5 verified for {Dest}", entry.Dest);
-                }
-                catch (Exception ex)
-                {
-                    SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] MD5 verification failed for {Dest}: {Err}", entry.Dest, ex.Message);
-                    throw;
-                }
-            }
+			if (skipBecauseValid)
+			{
+				// If this path wasn't counted during seeding, count it now so the file counter reflects reality.
+				if (!seededPaths.Contains(outputPath))
+				{
+					seededPaths.Add(outputPath);
+					installProgress.DownloadedCount++;
+				}
 
-            // Completed this entry: increment completed-file counter and update progress
-            try
-            {
-                installProgress.DownloadedCount++;
-                installProgress.DownloadedBytes = downloadedBytes > totalBytesToDownload && totalBytesToDownload > 0 ? totalBytesToDownload : downloadedBytes;
-                progressDelegate?.Invoke(in installProgress);
-            }
-            catch { }
+				// update bytes/progress
+				try
+				{
+					installProgress.DownloadedBytes = downloadedBytes > totalBytesToDownload && totalBytesToDownload > 0 ? totalBytesToDownload : downloadedBytes;
+					installProgress.TotalBytesToDownload = totalBytesToDownload;
+					progressDelegate?.Invoke(in installProgress);
+				}
+				catch { }
 
-            // Note: additional state updates (e.g. per-entry Completed) can be invoked here if desired.
-        }
+				SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Skipping entry (already valid): {Dest}", entry.Dest);
+				continue;
+			}
 
-        SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Install loop finished. Downloaded bytes sum: {Downloaded}", downloadedBytes);
+			// Signal state for currently downloading this entry
+			try
+			{
+				progressStateDelegate?.Invoke(InstallProgressState.Download);
+				progressDelegate?.Invoke(in installProgress);
+			}
+			catch
+			{
+				// ignore delegate invocation errors
+			}
 
-        // Installation finished: set current version, save config and write minimal app-game-config.json
-        try
-        {
-            // Update current game version and save plugin config so launcher recognizes installed version
-            GameManager.GetApiGameVersion(out GameVersion latestVersion);
-            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] API latest version: {Version}", latestVersion);
-            if (latestVersion != GameVersion.Empty)
-            {
-                GameManager.SetCurrentGameVersion(latestVersion);
-                GameManager.SaveConfig();
-                SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Saved current game version to config.");
-            }
+			// Download either as whole file or by chunks
+			Uri fileUri = new Uri(new Uri(baseDirectory), entry.Dest);
+			if (entry.ChunkInfos == null || entry.ChunkInfos.Length == 0)
+			{
+				// whole file with fallback attempts
+				SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Downloading whole file. URI: {Uri}", fileUri);
+				try
+				{
+					await TryDownloadWholeFileWithFallbacksAsync(fileUri, outputPath, entry.Dest, token, OnBytesWritten).ConfigureAwait(false);
+					SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Downloaded file: {Path}", outputPath);
+				}
+				catch (Exception ex)
+				{
+					SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] Failed to download file {Dest}: {Err}", entry.Dest, ex.Message);
+					throw;
+				}
+			}
+			else
+			{
+				// chunked: attempt chunked download; on 404 or failure, try encoded-path fallback once
+				SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Downloading chunked file. URI: {Uri}, Chunks: {Chunks}", fileUri, entry.ChunkInfos.Length);
+				try
+				{
+					await TryDownloadChunkedFileWithFallbacksAsync(fileUri, outputPath, entry.ChunkInfos, entry.Dest, token, OnBytesWritten).ConfigureAwait(false);
+					SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Downloaded chunked file: {Path}", outputPath);
+				}
+				catch (Exception ex)
+				{
+					SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] Failed to download chunked file {Dest}: {Err}", entry.Dest, ex.Message);
+					throw;
+				}
+			}
 
-            // Write a minimal app-game-config.json so other code that reads this file can find a version/index reference.
-            try
-            {
-                string configPath = Path.Combine(installPath, "app-game-config.json");
-                SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Writing app-game-config.json to {Path}", configPath);
-                using var ms = new MemoryStream();
-                var writerOptions = new JsonWriterOptions { Indented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
-                using (var writer = new Utf8JsonWriter(ms, writerOptions))
-                {
-                    writer.WriteStartObject();
-                    writer.WriteString("version", latestVersion == GameVersion.Empty ? string.Empty : latestVersion.ToString());
-                    // attempt to include indexFile filename if possible
-                    try
-                    {
-                        var idxName = new Uri(GameAssetBaseUrl ?? string.Empty, UriKind.Absolute).AbsolutePath;
-                        writer.WriteString("indexFile", Path.GetFileName(idxName));
-                    }
-                    catch
-                    {
-                        // ignore
-                    }
-                    writer.WriteEndObject();
-                    writer.Flush();
-                }
+			// Verify MD5 if provided
+			if (!string.IsNullOrEmpty(entry.Md5))
+			{
+				try
+				{
+					using var fsVerify = File.OpenRead(outputPath);
+					string md5 = ComputeMD5Hex(fsVerify);
+					if (!string.Equals(md5, entry.Md5, StringComparison.OrdinalIgnoreCase))
+					{
+						SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] MD5 mismatch for {Dest}. Expected {Expected}, got {Got}", entry.Dest, entry.Md5, md5);
+						throw new InvalidOperationException($"MD5 mismatch for {entry.Dest}: expected {entry.Md5}, got {md5}");
+					}
 
-                byte[] buffer = ms.ToArray();
-                await File.WriteAllBytesAsync(configPath, buffer, token).ConfigureAwait(false);
-                SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Wrote app-game-config.json (size={Size})", buffer.Length);
-            }
-            catch (Exception ex)
-            {
-                SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Failed to write app-game-config.json: {Err}", ex.Message);
-            }
-        }
-        catch (Exception ex)
-        {
-            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Post-install actions failed: {Err}", ex.Message);
-        }
+					SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] MD5 verified for {Dest}", entry.Dest);
+				}
+				catch (Exception ex)
+				{
+					SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallAsyncInner] MD5 verification failed for {Dest}: {Err}", entry.Dest, ex.Message);
+					throw;
+				}
+			}
 
-        // Ensure the UI/host knows installation completed and refresh config if possible.
-        try
-        {
-            // Refresh manager config/load to ensure any consumers reading config see the up-to-date state.
-            GameManager.LoadConfig();
+			// Completed this entry: increment completed-file counter and update progress
+			try
+			{
+				// mark path as seeded so we won't double count if another check occurs
+				seededPaths.Add(outputPath);
+				installProgress.DownloadedCount++;
+				installProgress.DownloadedBytes = downloadedBytes > totalBytesToDownload && totalBytesToDownload > 0 ? totalBytesToDownload : downloadedBytes;
+				progressDelegate?.Invoke(in installProgress);
+			}
+			catch { }
 
-            // Notify state change to "installed" and send a final progress update.
-            progressStateDelegate?.Invoke(InstallProgressState.Completed);
-            installProgress.DownloadedBytes = downloadedBytes > totalBytesToDownload && totalBytesToDownload > 0 ? totalBytesToDownload : downloadedBytes;
-            progressDelegate?.Invoke(in installProgress);
-        }
-        catch (Exception ex)
-        {
-            // If the enum value or delegate doesn't exist in certain builds, swallow to avoid crashing the installer.
-            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Finalizing install state failed or not available: {Err}", ex.Message);
-        }
-    }
+			// Note: additional state updates (e.g. per-entry Completed) can be invoked here if desired.
+		}
+
+		SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Install loop finished. Downloaded bytes sum: {Downloaded}", downloadedBytes);
+
+		// Installation finished: set current version, save config and write minimal app-game-config.json
+		try
+		{
+			// Update current game version and save plugin config so launcher recognizes installed version
+			GameManager.GetApiGameVersion(out GameVersion latestVersion);
+			SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] API latest version: {Version}", latestVersion);
+			if (latestVersion != GameVersion.Empty)
+			{
+				GameManager.SetCurrentGameVersion(latestVersion);
+				GameManager.SaveConfig();
+				SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Saved current game version to config.");
+			}
+
+			// Write a minimal app-game-config.json so other code that reads this file can find a version/index reference.
+			try
+			{
+				string configPath = Path.Combine(installPath, "app-game-config.json");
+				SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Writing app-game-config.json to {Path}", configPath);
+				using var ms = new MemoryStream();
+				var writerOptions = new JsonWriterOptions { Indented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+				using (var writer = new Utf8JsonWriter(ms, writerOptions))
+				{
+					writer.WriteStartObject();
+					writer.WriteString("version", latestVersion == GameVersion.Empty ? string.Empty : latestVersion.ToString());
+					// attempt to include indexFile filename if possible
+					try
+					{
+						var idxName = new Uri(GameAssetBaseUrl ?? string.Empty, UriKind.Absolute).AbsolutePath;
+						writer.WriteString("indexFile", Path.GetFileName(idxName));
+					}
+					catch
+					{
+						// ignore
+					}
+					writer.WriteEndObject();
+					writer.Flush();
+				}
+
+				byte[] buffer = ms.ToArray();
+				await File.WriteAllBytesAsync(configPath, buffer, token).ConfigureAwait(false);
+				SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Wrote app-game-config.json (size={Size})", buffer.Length);
+			}
+			catch (Exception ex)
+			{
+				SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Failed to write app-game-config.json: {Err}", ex.Message);
+			}
+		}
+		catch (Exception ex)
+		{
+			SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallAsyncInner] Post-install actions failed: {Err}", ex.Message);
+		}
+
+		// Ensure the UI/host knows installation completed and refresh config if possible.
+		try
+		{
+			// Refresh manager config/load to ensure any consumers reading config see the up-to-date state.
+			GameManager.LoadConfig();
+
+			// Notify state change to "installed" and send a final progress update.
+			progressStateDelegate?.Invoke(InstallProgressState.Completed);
+			installProgress.DownloadedBytes = downloadedBytes > totalBytesToDownload && totalBytesToDownload > 0 ? totalBytesToDownload : downloadedBytes;
+			progressDelegate?.Invoke(in installProgress);
+		}
+		catch (Exception ex)
+		{
+			// If the enum value or delegate doesn't exist in certain builds, swallow to avoid crashing the installer.
+			SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallAsyncInner] Finalizing install state failed or not available: {Err}", ex.Message);
+		}
+	}
 
     protected override Task StartPreloadAsyncInner(InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
     {
@@ -582,150 +640,123 @@ partial class WuwaGameInstaller : GameInstallerBase
         return sb.ToString();
     }
 
-    private async Task<WuwaApiResponseResourceIndex?> DownloadResourceIndexAsync(string indexUrl, CancellationToken token)
+    // Robust Download helpers with fallbacks and diagnostic logs
+    private async Task TryDownloadWholeFileWithFallbacksAsync(Uri originalUri, string outputPath, string rawDest, CancellationToken token, Action<long>? progressCallback)
     {
-        SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::DownloadResourceIndexAsync] Requesting index URL: {Url}", indexUrl);
-        using HttpResponseMessage resp = await _downloadHttpClient.GetAsync(indexUrl, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
-        resp.EnsureSuccessStatusCode();
-
-        await using var stream = await resp.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
-
-        // Reflection-based System.Text.Json is disabled in the host; parse with JsonDocument to avoid needing source-gen.
+        // Try original first
         try
         {
-            using JsonDocument doc = await JsonDocument.ParseAsync(stream, cancellationToken: token).ConfigureAwait(false);
-            JsonElement root = doc.RootElement;
-
-            // Case-insensitive property lookup helper
-            static bool TryGetPropertyCI(JsonElement el, string propName, out JsonElement value)
-            {
-                if (el.ValueKind != JsonValueKind.Object)
-                {
-                    value = default;
-                    return false;
-                }
-
-                foreach (var p in el.EnumerateObject())
-                {
-                    if (string.Equals(p.Name, propName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        value = p.Value;
-                        return true;
-                    }
-                }
-
-                value = default;
-                return false;
-            }
-
-            if (!TryGetPropertyCI(root, "resource", out JsonElement resourceElem) || resourceElem.ValueKind != JsonValueKind.Array)
-            {
-                SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::DownloadResourceIndexAsync] Index JSON contains no 'resource' array.");
-                return null;
-            }
-
-            var list = new System.Collections.Generic.List<WuwaApiResponseResourceEntry>(resourceElem.GetArrayLength());
-
-            foreach (var item in resourceElem.EnumerateArray())
-            {
-                if (item.ValueKind != JsonValueKind.Object)
-                    continue;
-
-                var entry = new WuwaApiResponseResourceEntry();
-
-                if (TryGetPropertyCI(item, "dest", out JsonElement destEl) && destEl.ValueKind == JsonValueKind.String)
-                    entry.Dest = destEl.GetString();
-
-                if (TryGetPropertyCI(item, "md5", out JsonElement md5El) && md5El.ValueKind == JsonValueKind.String)
-                    entry.Md5 = md5El.GetString();
-
-                // size may be number or string
-                if (TryGetPropertyCI(item, "size", out JsonElement sizeEl))
-                {
-                    try
-                    {
-                        if (sizeEl.ValueKind == JsonValueKind.Number && sizeEl.TryGetUInt64(out ulong uv))
-                            entry.Size = uv;
-                        else if (sizeEl.ValueKind == JsonValueKind.String && ulong.TryParse(sizeEl.GetString(), out uv))
-                            entry.Size = uv;
-                    }
-                    catch
-                    {
-                        entry.Size = 0;
-                    }
-                }
-
-                // chunkInfos (optional)
-                if (TryGetPropertyCI(item, "chunkInfos", out JsonElement chunksEl) && chunksEl.ValueKind == JsonValueKind.Array)
-                {
-                    var chunkList = new System.Collections.Generic.List<WuwaApiResponseResourceChunkInfo>(chunksEl.GetArrayLength());
-                    foreach (var c in chunksEl.EnumerateArray())
-                    {
-                        if (c.ValueKind != JsonValueKind.Object)
-                            continue;
-
-                        var ci = new WuwaApiResponseResourceChunkInfo();
-
-                        if (TryGetPropertyCI(c, "start", out JsonElement startEl))
-                        {
-                            if (startEl.ValueKind == JsonValueKind.Number && startEl.TryGetUInt64(out ulong sv))
-                                ci.Start = sv;
-                            else if (startEl.ValueKind == JsonValueKind.String && ulong.TryParse(startEl.GetString(), out sv))
-                                ci.Start = sv;
-                        }
-
-                        if (TryGetPropertyCI(c, "end", out JsonElement endEl))
-                        {
-                            if (endEl.ValueKind == JsonValueKind.Number && endEl.TryGetUInt64(out ulong ev))
-                                ci.End = ev;
-                            else if (endEl.ValueKind == JsonValueKind.String && ulong.TryParse(endEl.GetString(), out ev))
-                                ci.End = ev;
-                        }
-
-                        if (TryGetPropertyCI(c, "md5", out JsonElement cMd5El) && cMd5El.ValueKind == JsonValueKind.String)
-                            ci.Md5 = cMd5El.GetString();
-
-                        chunkList.Add(ci);
-                    }
-
-                    entry.ChunkInfos = chunkList.ToArray();
-                }
-
-                list.Add(entry);
-            }
-
-            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::DownloadResourceIndexAsync] Parsed index entries: {Count}", list.Count);
-            return new WuwaApiResponseResourceIndex { Resource = list.ToArray() };
+            await DownloadWholeFileAsync(originalUri, outputPath, token, progressCallback).ConfigureAwait(false);
+            return;
         }
-        catch (JsonException ex)
+        catch (HttpRequestException hre)
         {
-            // Malformed JSON or parse error; return null and let callers handle defensively.
-            SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::DownloadResourceIndexAsync] JSON parse error: {Err}", ex.Message);
-            return null;
+            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::TryDownloadWholeFileWithFallbacksAsync] Primary download failed: {Uri}. Reason: {Msg}", originalUri, hre.Message);
+            // fall through to fallback attempts
         }
+
+        // Build an encoded path (encode each segment, preserve slashes)
+        string encodedPath = EncodePathSegments(rawDest);
+
+        // Fallback 1: encoded concatenation using the Path portion of the original URI
+        try
+        {
+            var basePath = originalUri.GetLeftPart(UriPartial.Path);
+            string encodedConcatUrl = basePath.TrimEnd('/') + "/" + encodedPath;
+            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::TryDownloadWholeFileWithFallbacksAsync] Trying encoded concatenation fallback URI: {Uri}", encodedConcatUrl);
+            Uri fallbackUri = new Uri(encodedConcatUrl, UriKind.Absolute);
+            await DownloadWholeFileAsync(fallbackUri, outputPath, token, progressCallback).ConfigureAwait(false);
+            return;
+        }
+        catch (HttpRequestException hre)
+        {
+            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::TryDownloadWholeFileWithFallbacksAsync] Encoded concatenation fallback failed: {Msg}", hre.Message);
+        }
+
+        // Fallback 2: try using a simple concatenation (encoded)
+        try
+        {
+            var baseAuthority = originalUri.GetLeftPart(UriPartial.Authority);
+            var baseDir = originalUri.AbsolutePath;
+            int lastSlash = baseDir.LastIndexOf('/');
+            if (lastSlash >= 0)
+                baseDir = baseDir.Substring(0, lastSlash + 1);
+            string tryUrl = baseAuthority + baseDir + encodedPath;
+            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::TryDownloadWholeFileWithFallbacksAsync] Trying authority+dir fallback URI: {Uri}", tryUrl);
+            Uri fallbackUri2 = new Uri(tryUrl, UriKind.Absolute);
+            await DownloadWholeFileAsync(fallbackUri2, outputPath, token, progressCallback).ConfigureAwait(false);
+            return;
+        }
+        catch (HttpRequestException hre)
+        {
+            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::TryDownloadWholeFileWithFallbacksAsync] Authority+dir fallback failed: {Msg}", hre.Message);
+        }
+
+        // No more fallbacks
+        throw new HttpRequestException($"All download attempts failed for: {rawDest}");
     }
 
-    private async Task<WuwaApiResponseResourceIndex?> GetCachedIndexAsync(bool force, CancellationToken token)
+    private async Task TryDownloadChunkedFileWithFallbacksAsync(Uri originalUri, string outputPath, WuwaApiResponseResourceChunkInfo[] chunkInfos, string rawDest, CancellationToken token, Action<long>? progressCallback)
     {
-        if (!force && _currentIndex != null && DateTimeOffset.UtcNow <= _cacheExpiredUntil)
+        // Try original first
+        try
         {
-            SharedStatic.InstanceLogger.LogTrace("[WuwaGameInstaller::GetCachedIndexAsync] Returning cached index (entries={Count})", _currentIndex?.Resource?.Length ?? 0);
-            return _currentIndex;
+            await DownloadChunkedFileAsync(originalUri, outputPath, chunkInfos, token, progressCallback).ConfigureAwait(false);
+            return;
+        }
+        catch (HttpRequestException hre)
+        {
+            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::TryDownloadChunkedFileWithFallbacksAsync] Primary chunked download failed: {Uri}. Reason: {Msg}", originalUri, hre.Message);
+            // fall through to fallback attempts
         }
 
-        if (GameAssetBaseUrl is null)
+        // Build encoded path (encode each segment)
+        string encodedPath = EncodePathSegments(rawDest);
+
+        // Fallback 1: encoded concatenation using the Path portion of the original URI
+        try
         {
-            SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::GetCachedIndexAsync] GameAssetBaseUrl is null.");
-            throw new InvalidOperationException("Game asset base URL is not initialized.");
+            var basePath = originalUri.GetLeftPart(UriPartial.Path);
+            string encodedConcatUrl = basePath.TrimEnd('/') + "/" + encodedPath;
+            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::TryDownloadChunkedFileWithFallbacksAsync] Trying encoded concatenation fallback URI: {Uri}", encodedConcatUrl);
+            Uri fallbackUri = new Uri(encodedConcatUrl, UriKind.Absolute);
+            await DownloadChunkedFileAsync(fallbackUri, outputPath, chunkInfos, token, progressCallback).ConfigureAwait(false);
+            return;
+        }
+        catch (HttpRequestException hre)
+        {
+            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::TryDownloadChunkedFileWithFallbacksAsync] Encoded concatenation fallback failed: {Msg}", hre.Message);
         }
 
-        SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetCachedIndexAsync] Downloading index from: {Url}", GameAssetBaseUrl);
-        _currentIndex = await DownloadResourceIndexAsync(GameAssetBaseUrl, token).ConfigureAwait(false);
-        UpdateCacheExpiration();
-        return _currentIndex;
+        // Fallback 2: authority+dir + encoded path
+        try
+        {
+            var baseAuthority = originalUri.GetLeftPart(UriPartial.Authority);
+            var baseDir = originalUri.AbsolutePath;
+            int lastSlash = baseDir.LastIndexOf('/');
+            if (lastSlash >= 0)
+                baseDir = baseDir.Substring(0, lastSlash + 1);
+            string tryUrl = baseAuthority + baseDir + encodedPath;
+            SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::TryDownloadChunkedFileWithFallbacksAsync] Trying authority+dir fallback URI: {Uri}", tryUrl);
+            Uri fallbackUri2 = new Uri(tryUrl, UriKind.Absolute);
+            await DownloadChunkedFileAsync(fallbackUri2, outputPath, chunkInfos, token, progressCallback).ConfigureAwait(false);
+            return;
+        }
+        catch (HttpRequestException hre)
+        {
+            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::TryDownloadChunkedFileWithFallbacksAsync] Authority+dir fallback failed: {Msg}", hre.Message);
+        }
+
+        throw new HttpRequestException($"All chunked download attempts failed for: {rawDest}");
     }
 
-    private void UpdateCacheExpiration() => _cacheExpiredUntil = DateTimeOffset.UtcNow.AddMinutes(ExCacheDurationInMinute);
+    private static string EncodePathSegments(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return path;
+        string[] parts = path.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+        return string.Join("/", parts.Select(Uri.EscapeDataString));
+    }
 
     private async Task DownloadWholeFileAsync(Uri uri, string outputPath, CancellationToken token, Action<long>? progressCallback)
     {
@@ -733,7 +764,14 @@ partial class WuwaGameInstaller : GameInstallerBase
         SharedStatic.InstanceLogger.LogTrace("[WuwaGameInstaller::DownloadWholeFileAsync] Downloading {Uri} -> {Temp}", uri, tempPath);
         using (var resp = await _downloadHttpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false))
         {
-            resp.EnsureSuccessStatusCode();
+            if (!resp.IsSuccessStatusCode)
+            {
+                string body = string.Empty;
+                try { body = await resp.Content.ReadAsStringAsync(token).ConfigureAwait(false); } catch { }
+                SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::DownloadWholeFileAsync] Failed GET {Uri}: {Status}. Body preview: {BodyPreview}", uri, resp.StatusCode, body?.Length > 200 ? body.Substring(0, 200) + "..." : body);
+                throw new HttpRequestException($"Failed to GET {uri} : {(int)resp.StatusCode} {resp.StatusCode}", null, resp.StatusCode);
+            }
+
             using Stream content = await resp.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
             // ensure temp file is created (overwrite if exists)
             if (File.Exists(tempPath))
@@ -777,7 +815,7 @@ partial class WuwaGameInstaller : GameInstallerBase
             try
             {
                 foreach (var chunk in chunkInfos)
-                {
+               	{
                     token.ThrowIfCancellationRequested();
 
                     long start = (long)chunk.Start;
@@ -787,7 +825,13 @@ partial class WuwaGameInstaller : GameInstallerBase
                     request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(start, end);
 
                     using HttpResponseMessage resp = await _downloadHttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
-                    resp.EnsureSuccessStatusCode();
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        string body = string.Empty;
+                        try { body = await resp.Content.ReadAsStringAsync(token).ConfigureAwait(false); } catch { }
+                        SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::DownloadChunkedFileAsync] Failed GET {Uri} (range {Start}-{End}): {Status}. Body preview: {BodyPreview}", uri, start, end, resp.StatusCode, body?.Length > 200 ? body.Substring(0, 200) + "..." : body);
+                        throw new HttpRequestException($"Failed to GET {uri} range {start}-{end} : {(int)resp.StatusCode} {resp.StatusCode}", null, resp.StatusCode);
+                    }
 
                     using Stream content = await resp.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
 
@@ -894,4 +938,188 @@ partial class WuwaGameInstaller : GameInstallerBase
             return 0L;
         }
     }
+	// Add this method to the WuwaGameInstaller class to fix CS0103.
+	// This method provides a cached (with expiration) or fresh download of the resource index.
+	// It uses the _currentIndex field and _cacheExpiredUntil to manage cache expiration.
+
+	private async Task<WuwaApiResponseResourceIndex?> GetCachedIndexAsync(bool forceRefresh, CancellationToken token)
+	{
+		// Return cached if valid and not forced
+		if (!forceRefresh && _currentIndex != null && DateTimeOffset.UtcNow <= _cacheExpiredUntil)
+		{
+			SharedStatic.InstanceLogger.LogTrace("[WuwaGameInstaller::GetCachedIndexAsync] Returning cached index (entries={Count})", _currentIndex?.Resource?.Length ?? 0);
+			return _currentIndex;
+		}
+
+		if (GameAssetBaseUrl is null)
+		{
+			SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::GetCachedIndexAsync] GameAssetBaseUrl is null.");
+			throw new InvalidOperationException("Game asset base URL is not initialized.");
+		}
+
+		SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetCachedIndexAsync] Downloading index from: {Url}", GameAssetBaseUrl);
+
+		try
+		{
+			// Use the robust JSON parsing helper (handles case-insensitive keys, strings/numbers, chunkInfos, etc.)
+			var downloaded = await DownloadResourceIndexAsync(GameAssetBaseUrl, token).ConfigureAwait(false);
+			if (downloaded == null)
+			{
+				SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::GetCachedIndexAsync] DownloadResourceIndexAsync returned null for URL: {Url}", GameAssetBaseUrl);
+				// If we have a previous cached index and this wasn't forced, return it as a fallback
+				if (!forceRefresh && _currentIndex != null)
+					return _currentIndex;
+
+				return null;
+			}
+
+			_currentIndex = downloaded;
+			UpdateCacheExpiration();
+			SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetCachedIndexAsync] Cached index updated: {Count} entries", _currentIndex?.Resource?.Length ?? 0);
+			return _currentIndex;
+		}
+		catch (Exception ex)
+		{
+			SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::GetCachedIndexAsync] Failed to fetch/parse index: {Err}", ex.Message);
+			if (!forceRefresh && _currentIndex != null)
+				return _currentIndex;
+			return null;
+		}
+	}
+
+	private void UpdateCacheExpiration()
+	{
+		_cacheExpiredUntil = DateTimeOffset.UtcNow.AddMinutes(ExCacheDurationInMinute);
+	}
+	// Add this method to fix CS0103: The name 'DownloadResourceIndexAsync' does not exist in the current context.
+	// This method downloads and parses the resource index JSON from the given URL.
+
+	private async Task<WuwaApiResponseResourceIndex?> DownloadResourceIndexAsync(string url, CancellationToken token)
+	{
+		SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::DownloadResourceIndexAsync] Requesting index URL: {Url}", url);
+		using HttpResponseMessage resp = await _downloadHttpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+
+		if (!resp.IsSuccessStatusCode)
+		{
+			string bodyPreview = string.Empty;
+			try { bodyPreview = (await resp.Content.ReadAsStringAsync(token).ConfigureAwait(false))?.Trim() ?? string.Empty; } catch { }
+			SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::DownloadResourceIndexAsync] GET {Url} returned {Status}. Body preview: {Preview}", url, resp.StatusCode, bodyPreview.Length > 400 ? bodyPreview[..400] + "..." : bodyPreview);
+			return null;
+		}
+
+		await using var stream = await resp.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+
+		try
+		{
+			using JsonDocument doc = await JsonDocument.ParseAsync(stream, cancellationToken: token).ConfigureAwait(false);
+			JsonElement root = doc.RootElement;
+
+			// Case-insensitive property lookup helper
+			static bool TryGetPropertyCI(JsonElement el, string propName, out JsonElement value)
+			{
+				if (el.ValueKind != JsonValueKind.Object)
+				{
+					value = default;
+					return false;
+				}
+
+				foreach (var p in el.EnumerateObject())
+				{
+					if (string.Equals(p.Name, propName, StringComparison.OrdinalIgnoreCase))
+					{
+						value = p.Value;
+						return true;
+					}
+				}
+
+				value = default;
+				return false;
+			}
+
+			if (!TryGetPropertyCI(root, "resource", out JsonElement resourceElem) || resourceElem.ValueKind != JsonValueKind.Array)
+			{
+				SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::DownloadResourceIndexAsync] Index JSON contains no 'resource' array.");
+				return null;
+			}
+
+			var list = new System.Collections.Generic.List<WuwaApiResponseResourceEntry>(resourceElem.GetArrayLength());
+
+			foreach (var item in resourceElem.EnumerateArray())
+			{
+				if (item.ValueKind != JsonValueKind.Object)
+					continue;
+
+				var entry = new WuwaApiResponseResourceEntry();
+
+				if (TryGetPropertyCI(item, "dest", out JsonElement destEl) && destEl.ValueKind == JsonValueKind.String)
+					entry.Dest = destEl.GetString();
+
+				if (TryGetPropertyCI(item, "md5", out JsonElement md5El) && md5El.ValueKind == JsonValueKind.String)
+					entry.Md5 = md5El.GetString();
+
+				// size may be number or string
+				if (TryGetPropertyCI(item, "size", out JsonElement sizeEl))
+				{
+					try
+					{
+						if (sizeEl.ValueKind == JsonValueKind.Number && sizeEl.TryGetUInt64(out ulong uv))
+							entry.Size = uv;
+						else if (sizeEl.ValueKind == JsonValueKind.String && ulong.TryParse(sizeEl.GetString(), out uv))
+							entry.Size = uv;
+					}
+					catch
+					{
+						entry.Size = 0;
+					}
+				}
+
+				// chunkInfos (optional)
+				if (TryGetPropertyCI(item, "chunkInfos", out JsonElement chunksEl) && chunksEl.ValueKind == JsonValueKind.Array)
+				{
+					var chunkList = new System.Collections.Generic.List<WuwaApiResponseResourceChunkInfo>(chunksEl.GetArrayLength());
+					foreach (var c in chunksEl.EnumerateArray())
+					{
+						if (c.ValueKind != JsonValueKind.Object)
+							continue;
+
+						var ci = new WuwaApiResponseResourceChunkInfo();
+
+						if (TryGetPropertyCI(c, "start", out JsonElement startEl))
+						{
+							if (startEl.ValueKind == JsonValueKind.Number && startEl.TryGetUInt64(out ulong sv))
+								ci.Start = sv;
+							else if (startEl.ValueKind == JsonValueKind.String && ulong.TryParse(startEl.GetString(), out sv))
+								ci.Start = sv;
+						}
+
+						if (TryGetPropertyCI(c, "end", out JsonElement endEl))
+						{
+							if (endEl.ValueKind == JsonValueKind.Number && endEl.TryGetUInt64(out ulong ev))
+								ci.End = ev;
+							else if (endEl.ValueKind == JsonValueKind.String && ulong.TryParse(endEl.GetString(), out ev))
+								ci.End = ev;
+						}
+
+						if (TryGetPropertyCI(c, "md5", out JsonElement cMd5El) && cMd5El.ValueKind == JsonValueKind.String)
+							ci.Md5 = cMd5El.GetString();
+
+						chunkList.Add(ci);
+					}
+
+					entry.ChunkInfos = chunkList.ToArray();
+				}
+
+				list.Add(entry);
+			}
+
+			SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::DownloadResourceIndexAsync] Parsed index entries: {Count}", list.Count);
+			return new WuwaApiResponseResourceIndex { Resource = list.ToArray() };
+		}
+		catch (JsonException ex)
+		{
+			// Malformed JSON or parse error; return null and let callers handle defensively.
+			SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::DownloadResourceIndexAsync] JSON parse error: {Err}", ex.Message);
+			return null;
+		}
+	}
 }
