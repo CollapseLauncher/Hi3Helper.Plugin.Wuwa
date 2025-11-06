@@ -13,7 +13,7 @@ using System.Threading.Tasks;
 
 namespace Hi3Helper.Plugin.Wuwa.Management.PresetConfig;
 [GeneratedComClass]
-public partial class WuwaGlobalPresetConfig : PluginPresetConfigBase
+public partial class WuwaGlobalPresetConfig : WuwaPresetConfig
 {
     private const string ApiResponseUrl = "https://prod-alicdn-gamestarter.kurogame.com/";
     private const string ApiResponseAssetUrl = "https://pcdownload-huoshan.aki-game.net/";
@@ -24,20 +24,25 @@ public partial class WuwaGlobalPresetConfig : PluginPresetConfigBase
     private const string Hash1 = "DSQONC4ZUxIkByA1CgANJC0OJw4lNhYMIRQHB1EtJ1s";
     private const string Hash2 = "JRUpJyABCwclGTQGMiUrOhkgOTkIIgIqBQkJMCE7JS8";
     private const string ExecutableName = "Wuthering Waves.exe";
-    private const string VendorName = "Kuro Games";
+    private const string EngineExecutableName = "Client-Win64-Shipping.exe";
+	private const string VendorName = "Kuro Games";
 
     [field: AllowNull, MaybeNull]
     public override string GameName => field ??= "Wuthering Waves";
 
-    public override string GameExecutableName => ExecutableName;
+	[field: AllowNull, MaybeNull]
+	public override string GameExecutableName => field ??= Path.Combine("Client", "Binaries", "Win64", EngineExecutableName);
 
-    public override string GameAppDataPath
+    [field: AllowNull, MaybeNull]
+    public override string? StartExecutableName => field ??= ExecutableName;
+
+	public override string GameAppDataPath
     {
         get
         {
             string? gamePath = null;
             GameManager?.GetGamePath(out gamePath);
-            return string.IsNullOrEmpty(gamePath) ? string.Empty : Path.Combine(gamePath, "Client");
+            return string.IsNullOrEmpty(gamePath) ? string.Empty : Path.Combine(gamePath, "Client", "Saved");
         }
     }
     
