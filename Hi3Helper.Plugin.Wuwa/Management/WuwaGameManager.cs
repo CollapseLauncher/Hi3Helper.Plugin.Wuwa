@@ -116,7 +116,7 @@ internal partial class WuwaGameManager : GameManagerBase
                 Path.Combine(CurrentGameInstallPath ?? string.Empty, CurrentGameExecutableByPreset);
             string executablePath2 = Path.Combine(CurrentGameInstallPath ?? string.Empty,
                 Path.Combine(CurrentGameInstallPath!,
-                "Client\\Binaries\\Win64\\Client-Win64-ShippingBase.dll"))
+                "Client\\Binaries\\Win64\\Client-Win64-ShippingBase.dll"));
             string executablePath3 = Path.Combine(CurrentGameInstallPath ?? string.Empty,
                 Path.Combine(CurrentGameInstallPath!,
 				"Client\\Binaries\\Win64\\Client-Win64-Shipping.exe"));
