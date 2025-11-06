@@ -115,12 +115,15 @@ internal partial class WuwaGameManager : GameManagerBase
             string executablePath1 =
                 Path.Combine(CurrentGameInstallPath ?? string.Empty, CurrentGameExecutableByPreset);
             string executablePath2 = Path.Combine(CurrentGameInstallPath ?? string.Empty,
-                Path.GetFileNameWithoutExtension(CurrentGameExecutableByPreset), "Client-Win64-ShippingBase.dll");
-            string executablePath3 = Path.Combine(CurrentGameInstallPath ?? string.Empty, "WutheringWaves.exe");
-            string executablePath4 = Path.Combine(CurrentGameInstallPath ?? string.Empty,
-                Path.Combine(Path.GetFileNameWithoutExtension(CurrentGameExecutableByPreset),
-                    "ThirdParty/KrPcSdk_Global/KRSDKRes"), "KRSDK.bin");
-            return File.Exists(executablePath1) && File.Exists(executablePath2) && File.Exists(executablePath3) &&
+                Path.Combine(CurrentGameInstallPath!,
+                "Client\\Binaries\\Win64\\Client-Win64-ShippingBase.dll"))
+            string executablePath3 = Path.Combine(CurrentGameInstallPath ?? string.Empty,
+                Path.Combine(CurrentGameInstallPath!,
+				"Client\\Binaries\\Win64\\Client-Win64-Shipping.exe"));
+			string executablePath4 = Path.Combine(CurrentGameInstallPath ?? string.Empty,
+                Path.Combine(CurrentGameInstallPath!,
+					"Client\\Binaries\\Win64\\ThirdParty\\KrPcSdk_Global\\KRSDKRes\\KRSDK.bin"));
+			return File.Exists(executablePath1) && File.Exists(executablePath2) && File.Exists(executablePath3) &&
                    File.Exists(executablePath4);
         }
     }
@@ -197,7 +200,7 @@ internal partial class WuwaGameManager : GameManagerBase
             throw new InvalidOperationException(
                 $"API GameConfig returns an invalid CurrentVersion data! Data: {ApiGameConfigResponse.Default.ConfigReference.CurrentVersion}");
 
-        ApiGameVersion = ApiGameConfigResponse.Default.ConfigReference.CurrentVersion;
+        ApiGameVersion = new GameVersion(ApiGameConfigResponse.Default.ConfigReference.CurrentVersion.ToString());
         IsInitialized = true;
 
         return 0;
@@ -258,39 +261,10 @@ internal partial class WuwaGameManager : GameManagerBase
                     }
                 }
             }
-            catch (OperationCanceledException)
+            catch (Exception)
             {
                 return null;
             }
-            catch (ArgumentException ex)
-            {
-#if DEBUG
-            SharedStatic.InstanceLogger.LogTrace("ArgumentException while enumerating files: {Error}", ex.Message);
-#endif
-                return null;
-            }
-            catch (PathTooLongException ex)
-            {
-#if DEBUG
-            SharedStatic.InstanceLogger.LogTrace("PathTooLongException while enumerating files: {Error}", ex.Message);
-#endif
-                return null;
-            }
-            catch (UnauthorizedAccessException ex)
-            {
-#if DEBUG
-            SharedStatic.InstanceLogger.LogTrace("Access denied while enumerating files: {Error}", ex.Message);
-#endif
-                return null;
-            }
-            catch (IOException ex)
-            {
-#if DEBUG
-            SharedStatic.InstanceLogger.LogTrace("IO error while enumerating files: {Error}", ex.Message);
-#endif
-                return null;
-            }
-
             return null;
         }, token);
 
@@ -326,7 +300,7 @@ internal partial class WuwaGameManager : GameManagerBase
             SharedStatic.InstanceLogger.LogTrace(
 				"[WuwaGameManager::LoadConfig] Loaded app-game-config.json from directory: {Dir}",
                 CurrentGameInstallPath);
-        }
+		}
         catch (Exception ex)
         {
             SharedStatic.InstanceLogger.LogError(
