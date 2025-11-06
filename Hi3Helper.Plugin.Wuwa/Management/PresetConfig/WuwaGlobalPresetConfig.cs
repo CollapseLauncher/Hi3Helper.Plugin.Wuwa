@@ -24,12 +24,14 @@ public partial class WuwaGlobalPresetConfig : PluginPresetConfigBase
     private const string Hash1 = "DSQONC4ZUxIkByA1CgANJC0OJw4lNhYMIRQHB1EtJ1s";
     private const string Hash2 = "JRUpJyABCwclGTQGMiUrOhkgOTkIIgIqBQkJMCE7JS8";
     private const string ExecutableName = "Wuthering Waves.exe";
-    private const string VendorName = "Kuro Games";
+    private const string EngineExecutableName = "Client-Win64-Shipping.exe";
+	private const string VendorName = "Kuro Games";
 
     [field: AllowNull, MaybeNull]
     public override string GameName => field ??= "Wuthering Waves";
 
-    public override string GameExecutableName => ExecutableName;
+	[field: AllowNull, MaybeNull]
+	public override string GameExecutableName => field ??= Path.Combine("Client", "Binaries", "Win64", EngineExecutableName);
 
     public override string GameAppDataPath
     {
