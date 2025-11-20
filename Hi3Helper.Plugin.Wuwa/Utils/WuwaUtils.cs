@@ -222,8 +222,6 @@ internal static class WuwaUtils
         stream.Seek(0, SeekOrigin.Begin);
         using var md5 = MD5.Create();
 
-        await md5.ComputeHashAsync(stream, token);
-
         byte[] buffer = ArrayPool<byte>.Shared.Rent(64 << 10); // 64 KiB buffer
         try
         {

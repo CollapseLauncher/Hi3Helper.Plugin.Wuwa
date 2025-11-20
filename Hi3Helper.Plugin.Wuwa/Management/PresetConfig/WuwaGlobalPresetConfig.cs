@@ -67,7 +67,7 @@ public partial class WuwaGlobalPresetConfig : WuwaPresetConfig
     public override string ZoneName => field ??= "Global";
 
     [field: AllowNull, MaybeNull]
-    public override string ZoneFullName => field ??= GameName + " (" + ZoneName + " )";
+    public override string ZoneFullName => field ??= GameName + " (" + ZoneName + ")";
 
     [field: AllowNull, MaybeNull]
     public override string ZoneLogoUrl => field ??= "https://cdn.collapselauncher.com/cl-cdn/inhouse-plugin/wuwa/wuthering-waves-logo.png";

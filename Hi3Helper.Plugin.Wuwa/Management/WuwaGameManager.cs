@@ -60,7 +60,7 @@ internal partial class WuwaGameManager : GameManagerBase
         set;
     }
 
-    private string ApiResponseAssetUrl { get; }
+    internal string ApiResponseAssetUrl { get; }
     private string GameTag { get; set; }
     private string ClientAccess { get; set; }
     private string CurrentPatch { get; set; }
@@ -74,7 +74,7 @@ internal partial class WuwaGameManager : GameManagerBase
     private JsonObject CurrentGameConfigNode { get; set; } = new();
 
     internal string? GameResourceBaseUrl { get; set; }
-    private string? GameResourceBasisPath { get; set; }
+    internal string? GameResourceBasisPath { get; set; }
     private bool IsInitialized { get; set; }
     
 
