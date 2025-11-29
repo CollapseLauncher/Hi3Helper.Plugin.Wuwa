@@ -268,7 +268,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 		installProgress.TotalBytesToDownload = totalBytesToDownload;
 
 		int lastLoggedDownloadedCount = -1;
-		void ReportProgress()
+		void ReportProgress(InstallProgressState currentState)
 		{
 			try
 			{
@@ -297,7 +297,8 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 #pragma warning restore CS0618
 
 				progressDelegate?.Invoke(in snap);
-			}
+                progressStateDelegate?.Invoke(currentState);
+            }
 			catch (Exception ex)
 			{
 				SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::ReportProgress] Failed to invoke progress delegate: {Err}", ex.Message);
@@ -305,10 +306,9 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 			}
 		}
 
-		// Send initial update
-		try { progressStateDelegate?.Invoke(InstallProgressState.Preparing); } catch { }
-		ReportProgress();
-
+        // Send initial update
+        ReportProgress(InstallProgressState.Preparing);
+		
 		// Collections for verification/cleanup
 		var filesToDelete = new ConcurrentBag<string>();
 
@@ -317,8 +317,8 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 		{
 			if (delta == 0) return;
 			Interlocked.Add(ref installProgress.DownloadedBytes, delta);
-			ReportProgress();
-		}
+			ReportProgress(InstallProgressState.Download);
+        }
 
 		#region Download Implementation
 		SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallAsyncInner] Starting download phase (count={Count})", downloadList.Count);
@@ -349,7 +349,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 						if (seededPaths.Add(outputPath))
 							Interlocked.Increment(ref installProgress.DownloadedCount);
 
-						ReportProgress();
+						ReportProgress(InstallProgressState.Download);
 						return;
 					}
 				}
@@ -381,7 +381,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 			// After download, increment state counter (verification step will validate integrity)
 			Interlocked.Increment(ref installProgress.StateCount);
 			Interlocked.Increment(ref installProgress.DownloadedCount);
-			ReportProgress();
+			ReportProgress(InstallProgressState.Download);
 		});
 		#endregion
 
@@ -390,8 +390,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 		Volatile.Write(ref installProgress.StateCount, 0);
 		Volatile.Write(ref installProgress.DownloadedCount, 0);
 		Interlocked.Exchange(ref installProgress.DownloadedBytes, 0L);
-		ReportProgress();
-		try { progressStateDelegate?.Invoke(InstallProgressState.Verify); } catch { }
+		ReportProgress(InstallProgressState.Verify);
 
 		await Parallel.ForEachAsync(downloadList, new ParallelOptions
 		{
@@ -440,7 +439,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 				if (fi.Exists)
 					Interlocked.Add(ref installProgress.DownloadedBytes, fi.Length);
 
-				ReportProgress();
+				ReportProgress(InstallProgressState.Verify);
 			}
 			catch (Exception ex)
 			{
@@ -482,7 +481,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 
 						Interlocked.Increment(ref installProgress.StateCount);
 						Interlocked.Increment(ref installProgress.DownloadedCount);
-						ReportProgress();
+						ReportProgress(InstallProgressState.Download);
 					}
 					catch (Exception ex)
 					{
@@ -498,8 +497,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 		Volatile.Write(ref installProgress.StateCount, 0);
 		Volatile.Write(ref installProgress.DownloadedCount, 0);
 		Interlocked.Exchange(ref installProgress.DownloadedBytes, 0L);
-		ReportProgress();
-		try { progressStateDelegate?.Invoke(InstallProgressState.Install); } catch { }
+		ReportProgress(InstallProgressState.Install);
 
 		foreach (var kv in downloadList)
 		{
@@ -530,7 +528,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 
 			Interlocked.Increment(ref installProgress.StateCount);
 			Interlocked.Increment(ref installProgress.DownloadedCount);
-			ReportProgress();
+			ReportProgress(InstallProgressState.Install);
 		}
 
 		// Cleanup temp directory if empty
@@ -598,7 +596,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 			long downloaded = Interlocked.Read(ref installProgress.DownloadedBytes);
 			if (totalBytes > 0 && downloaded > totalBytes)
 				Interlocked.Exchange(ref installProgress.DownloadedBytes, totalBytes);
-			ReportProgress();
+			ReportProgress(InstallProgressState.Install);
 		}
 		catch
 		{
@@ -889,6 +887,8 @@ internal partial class WuwaGameInstaller : GameInstallerBase
             if (string.IsNullOrEmpty(installPath))
                 return 0L;
 
+            var tempDirPath = Path.Combine(installPath, "TempPath", "TempGameFiles");
+
             long total = 0L;
             foreach (var entry in index.Resource)
             {
@@ -898,7 +898,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
                     continue;
 
                 string relativePath = entry.Dest.Replace('/', Path.DirectorySeparatorChar);
-                string outputPath = Path.Combine(installPath, relativePath);
+                string outputPath = Path.Combine(tempDirPath, relativePath);
                 string tempPath = outputPath + ".tmp";
 
                 // If final file exists -> count its actual size
