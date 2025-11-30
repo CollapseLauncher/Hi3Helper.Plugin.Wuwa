@@ -1,0 +1,80 @@
+name: Release Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version'
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for changelog
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Restore dependencies
+      run: dotnet restore --runtime win-x64 Hi3Helper.Plugin.Wuwa.sln
+
+    - name: Build solution
+      run: dotnet build --configuration Release --runtime win-x64 Hi3Helper.Plugin.Wuwa.sln --no-restore
+
+    - name: Publish with ReleaseNoReflectionPublish-O1 profile
+      run: dotnet publish Hi3Helper.Plugin.Wuwa/Hi3Helper.Plugin.Wuwa.csproj --configuration Release --runtime win-x64 /p:PublishProfile=ReleaseNoReflectionPublish-O1 -o ./publish
+
+    - name: Run Indexer
+      run: .\Indexer.exe .\publish
+
+    - name: Generate Changelog
+      uses: orhun/git-cliff-action@v4
+      with:
+        configuration: cliff.toml
+        args: --latest --strip header
+      id: git-cliff
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ inputs.version }}
+        name: Release v${{ inputs.version }}
+        body: ${{ steps.git-cliff.outputs.content }}
+        files: ./publish/build/*.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create Pull Request in Release Repo
+      uses: peter-evans/create-pull-request@v7
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        repository: CollapseLauncher/CollapseLauncher-ReleaseRepo
+        branch: wuwa-plugin-release-${{ inputs.version }}
+        base: main
+        title: 'Release Wuwa Plugin v${{ inputs.version }}'
+        body: |
+          Automated release of Wuwa Plugin v${{ inputs.version }}
+
+          ${{ steps.git-cliff.outputs.content }}
+
+          Files updated:
+          - Waves.dll
+          - Waves.pdb
+          - manifest.json
+          - build/*.zip
+        commit-message: 'Release Wuwa Plugin v${{ inputs.version }}'
+        path: inhouse-plugin/wuwa
+        add-paths: |
+          ./publish/Waves.dll
+          ./publish/Waves.pdb
+          ./publish/manifest.json
+          ./publish/build/*.zip
+        delete-branch: false
