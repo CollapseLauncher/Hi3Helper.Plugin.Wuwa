@@ -20,6 +20,10 @@ on:
         - DebugNoReflectionPublish
         default: ReleaseNoReflectionPublish-O1
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
