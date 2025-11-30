@@ -35,6 +35,16 @@ jobs:
       with:
         dotnet-version: '10.0.x'
 
+    - name: Set publish profile
+      shell: pwsh
+      run: |
+        if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+          $profile = '${{ inputs.publish_profile }}'
+        } else {
+          $profile = 'ReleaseNoReflectionPublish-O1'
+        }
+        echo "PUBLISH_PROFILE=$profile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
     - name: Restore dependencies
       run: dotnet restore Hi3Helper.Plugin.Wuwa.sln
 
@@ -42,7 +52,7 @@ jobs:
       run: dotnet build --configuration Release Hi3Helper.Plugin.Wuwa.sln --no-restore
 
     - name: Publish with selected profile
-      run: dotnet publish Hi3Helper.Plugin.Wuwa/Hi3Helper.Plugin.Wuwa.csproj --configuration Release --runtime win-x64 /p:PublishProfile=${{ inputs.publish_profile }} -o ./publish
+      run: dotnet publish Hi3Helper.Plugin.Wuwa/Hi3Helper.Plugin.Wuwa.csproj --configuration Release --runtime win-x64 /p:PublishProfile=$PUBLISH_PROFILE -o ./publish
 
     - name: Generate build provenance
       uses: actions/attest-build-provenance@v1
