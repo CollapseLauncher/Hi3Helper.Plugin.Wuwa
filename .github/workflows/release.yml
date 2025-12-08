@@ -75,7 +75,7 @@ jobs:
       uses: orhun/git-cliff-action@v4
       with:
         config: cliff.toml
-        args: --unreleased --strip header
+        args: --latest --strip header --tag ${{ github.ref_name }}
       id: git-cliff
 
     - name: Checkout target repo
