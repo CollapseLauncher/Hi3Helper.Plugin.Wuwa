@@ -62,7 +62,7 @@ jobs:
       uses: orhun/git-cliff-action@v4
       with:
         config: cliff.toml
-        args: --unreleased --strip header
+        args: --latest --strip header
       id: git-cliff
 
     - name: Create Release
