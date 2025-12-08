@@ -58,13 +58,6 @@ jobs:
     - name: Run Indexer
       run: .\Indexer.exe .\publish
 
-    - name: Generate Changelog
-      uses: orhun/git-cliff-action@v4
-      with:
-        config: cliff.toml
-        args: --latest --strip header
-      id: git-cliff
-
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
@@ -74,6 +67,16 @@ jobs:
         files: ./publish/*.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Force Fetch Tags
+      run: git fetch --force --tags
+    
+    - name: Generate Changelog
+      uses: orhun/git-cliff-action@v4
+      with:
+        config: cliff.toml
+        args: --latest --strip header
+      id: git-cliff
 
     - name: Checkout target repo
       uses: actions/checkout@v4
