@@ -82,8 +82,8 @@ jobs:
         tag_name: v${{ inputs.version }}
         name: Release v${{ inputs.version }}
         body: ${{ steps.git-cliff.outputs.content }}
-        # We upload ONLY the clean zip we made in Step 1
-        files: ./Waves_v${{ inputs.version }}.zip
+        # Upload zip with correct manifest from step 2
+        files: ./publish/*.zip
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
