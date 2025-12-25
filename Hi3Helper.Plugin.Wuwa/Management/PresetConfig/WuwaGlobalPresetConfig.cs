@@ -75,7 +75,7 @@ public partial class WuwaGlobalPresetConfig : WuwaPresetConfig
     [field: AllowNull, MaybeNull]
     public override string ZoneHomePageUrl => field ??= "https://wutheringwaves.kurogames.com/en/main";
 
-    public override GameReleaseChannel ReleaseChannel => GameReleaseChannel.ClosedBeta;
+    public override GameReleaseChannel ReleaseChannel => GameReleaseChannel.OpenBeta;
 
     [field: AllowNull, MaybeNull]
     public override string GameMainLanguage => field ??= "en";
