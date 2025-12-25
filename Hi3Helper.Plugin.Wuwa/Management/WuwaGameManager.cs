@@ -422,4 +422,18 @@ internal partial class WuwaGameManager : GameManagerBase
                 "[WuwaGameManager::SaveConfig] Failed to write app-game-config.json: {Exception}", ex);
         }
     }
+
+    public void LogVersions()
+    {
+        try
+        {
+            GameVersion apiVer = ApiGameVersion;
+            GameVersion curVer = CurrentGameVersion;
+            SharedStatic.InstanceLogger.LogInformation("[WuwaGameManager::LogVersions] ApiGameVersion={Api} CurrentGameVersion={Current}", apiVer, curVer);
+        }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogWarning("[WuwaGameManager::LogVersions] Failed to log versions: {Err}", ex.Message);
+        }
+    }
 }
