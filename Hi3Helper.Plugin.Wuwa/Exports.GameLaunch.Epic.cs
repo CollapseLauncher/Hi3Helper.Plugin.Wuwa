@@ -38,7 +38,7 @@ public partial class Exports
 		int delay = 0;
 		while (EpicProcesses.Length == 0 && delay < 15000)
 		{
-			EpicProcesses = Process.GetProcessesByName("EMLauncher-Win64-Shipping");
+			EpicProcesses = Process.GetProcessesByName("launcher_main");
 
 			await Task.Delay(200, token);
 			delay += 200;
