@@ -19,7 +19,7 @@ public partial class WuwaGlobalPresetConfig : WuwaPresetConfig
     protected const string ApiResponseAssetUrl = "https://pcdownload-huoshan.aki-game.net/";
     protected const string CurrentTag = "JFJWUA";
     protected const string AuthenticationHash = "VlNTU1c8DAEsKzslESUCDRIQAiomLA4WKBEMIAABOQgyMSEgVAA";
-    protected const string Hash1 = "DBAwDDtQUDsiOi4bIFFUUVUnNzoaARURLlQVKSEyFAo";
+    protected const string Hash1 = "VzMgJyIRJlMyEgYHViowOSUSDBUQGhpSMDknVSJbBhA";
     protected const string ExecutableName = "Wuthering Waves.exe";
     private const string EngineExecutableName = "Client-Win64-Shipping.exe";
 	private const string VendorName = "Kuro Games";
