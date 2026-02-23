@@ -460,7 +460,12 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 // Check whether the installed files already match the TARGET version's hashes.
                 // This handles the case where both version JSONs are stale (e.g. game updated
                 // externally) but all files on disk are already at the target version.
-                if (!onlyDownload && patchIndex.GroupInfos.Length > 0)
+                if (manager.DEBUG_SkipPreflight)
+                {
+                    SharedStatic.InstanceLogger.LogWarning(
+                        "[Patch::RunAsync] Pre-flight validation SKIPPED (DEBUG_skipPreflight=true). Proceeding to download + patch.");
+                }
+                else if (!onlyDownload && patchIndex.GroupInfos.Length > 0)
                 {
                     currentProgressState = InstallProgressState.Verify;
 

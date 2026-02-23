@@ -85,6 +85,16 @@ internal partial class WuwaGameManager : GameManagerBase
     /// </summary>
     internal GameVersion DEBUG_DowngradeVersionTarget { get; set; } = GameVersion.Empty;
 
+    /// <summary>
+    /// When true, the pre-flight validation (which checks whether local files already
+    /// match the target version) is skipped, forcing the patch flow to always download
+    /// and apply krpdiff patches. Useful for testing the actual patch-apply logic when
+    /// the game is already at the target version.
+    /// Persisted as <c>DEBUG_skipPreflight</c> in <c>app-game-config.json</c>.
+    /// The key is never written by default — add it manually to the JSON to enable.
+    /// </summary>
+    internal bool DEBUG_SkipPreflight { get; set; }
+
     protected override GameVersion CurrentGameVersion
     {
         get
@@ -367,10 +377,10 @@ internal partial class WuwaGameManager : GameManagerBase
         SharedStatic.InstanceLogger.LogDebug(
             "[WuwaGameManager::GameState] IsInstalled={IsInstalled}, ApiGameVersion={ApiVer}, CurrentGameVersion={CurVer}, " +
             "ApiPreloadGameVersion={PreloadVer}, HasPendingPreloadPatch={PendingPatch}, PatchDir={PatchDir}, " +
-            "HasUpdate={HasUpdate}, HasPreload={HasPreload}, DEBUG_AllowDowngrade={AllowDowngrade}, DEBUG_DowngradeVersionTarget={DowngradeTarget}",
+            "HasUpdate={HasUpdate}, HasPreload={HasPreload}, DEBUG_AllowDowngrade={AllowDowngrade}, DEBUG_DowngradeVersionTarget={DowngradeTarget}, DEBUG_SkipPreflight={SkipPreflight}",
             IsInstalled, ApiGameVersion, CurrentGameVersion,
             ApiPreloadGameVersion, HasPendingPreloadPatch, patchTempPath,
-            HasUpdate, HasPreload, DEBUG_AllowDowngrade, DEBUG_DowngradeVersionTarget);
+            HasUpdate, HasPreload, DEBUG_AllowDowngrade, DEBUG_DowngradeVersionTarget, DEBUG_SkipPreflight);
     }
 
     protected override Task DownloadAssetAsyncInner(HttpClient? client, string fileUrl, Stream outputStream,
@@ -543,9 +553,11 @@ internal partial class WuwaGameManager : GameManagerBase
 #if !USELIGHTWEIGHTJSONPARSER
         DEBUG_AllowDowngrade = CurrentGameConfigNode.GetConfigValue<bool?>("DEBUG_allowDowngrade") ?? false;
         string? targetStr = CurrentGameConfigNode.GetConfigValue<string?>("DEBUG_downgradeVersionTarget");
+        DEBUG_SkipPreflight = CurrentGameConfigNode.GetConfigValue<bool?>("DEBUG_skipPreflight") ?? false;
 #else
         DEBUG_AllowDowngrade = CurrentGameConfigNode["DEBUG_allowDowngrade"]?.GetValue<bool>() ?? false;
         string? targetStr = CurrentGameConfigNode["DEBUG_downgradeVersionTarget"]?.GetValue<string>();
+        DEBUG_SkipPreflight = CurrentGameConfigNode["DEBUG_skipPreflight"]?.GetValue<bool>() ?? false;
 #endif
 
         if (!string.IsNullOrEmpty(targetStr) &&
@@ -564,6 +576,12 @@ internal partial class WuwaGameManager : GameManagerBase
             SharedStatic.InstanceLogger.LogWarning(
                 "[WuwaGameManager::LoadDowngradeSettings] Downgrade enabled. Target version: {Ver}",
                 DEBUG_DowngradeVersionTarget);
+        }
+
+        if (DEBUG_SkipPreflight)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameManager::LoadDowngradeSettings] Pre-flight validation will be SKIPPED (DEBUG_skipPreflight=true).");
         }
     }
 
@@ -682,6 +700,8 @@ internal partial class WuwaGameManager : GameManagerBase
             else
                 CurrentGameConfigNode.Remove("DEBUG_downgradeVersionTarget");
         }
+        if (CurrentGameConfigNode.ContainsKey("DEBUG_skipPreflight"))
+            CurrentGameConfigNode["DEBUG_skipPreflight"] = DEBUG_SkipPreflight;
 
         if (CurrentGameVersion == GameVersion.Empty)
         {
