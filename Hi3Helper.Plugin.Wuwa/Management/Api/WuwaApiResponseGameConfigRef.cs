@@ -19,6 +19,9 @@ public class WuwaApiResponseGameConfigRef
     public string? PatchType { get; set; }
 
     [JsonPropertyName("size")] // Mapping: root -> default -> config -> size
+    // NOTE: For old-style patchConfig entries this equals the full game content size (same
+    // as unCompressSize), NOT the actual patch download size. Always prefer computing the
+    // real download size from the patch index krpdiff entries instead of using this field.
     [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
     public ulong? PatchFileSize { get; set; }
 

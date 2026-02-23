@@ -35,6 +35,9 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
         /// <summary>
         /// Calculates the total patch download size from the patch index.
+        /// Always downloads the actual patch index to compute accurate krpdiff sizes
+        /// rather than trusting the config's "size" field, which for older patch entries
+        /// represents the full game content size rather than the patch download size.
         /// </summary>
         internal async Task<long> CalculatePatchSizeAsync(GameInstallerKind kind, CancellationToken token)
         {
@@ -55,28 +58,42 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 return 0L;
             }
 
-            // If PatchFileSize is available in the config, use it directly
-            if (patchConfig.PatchFileSize is > 0)
-                return (long)patchConfig.PatchFileSize.Value;
-
-            // Otherwise, download the patch index and sum krpdiff sizes
+            // Always download the patch index to compute actual krpdiff sizes.
+            // The config "size" field is unreliable — for old-style entries it equals the
+            // full game content size, not the patch download size.
             string? patchIndexUrl = BuildPatchIndexUrl(patchConfig);
             if (string.IsNullOrEmpty(patchIndexUrl))
+            {
+                SharedStatic.InstanceLogger.LogWarning(
+                    "[WuwaGameInstaller::CalculatePatchSizeAsync] Cannot build patch index URL for version {Version}",
+                    currentVersion);
                 return 0L;
+            }
 
             var patchIndex = await DownloadPatchIndexAsync(patchIndexUrl, token).ConfigureAwait(false);
             if (patchIndex == null)
+            {
+                SharedStatic.InstanceLogger.LogWarning(
+                    "[WuwaGameInstaller::CalculatePatchSizeAsync] Failed to download patch index for version {Version}",
+                    currentVersion);
                 return 0L;
+            }
 
             ulong total = 0;
+            int krpCount = 0;
             foreach (var entry in patchIndex.Resource)
             {
                 if (!string.IsNullOrEmpty(entry.Dest) &&
                     entry.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase))
                 {
                     total += entry.Size;
+                    krpCount++;
                 }
             }
+
+            SharedStatic.InstanceLogger.LogInformation(
+                "[WuwaGameInstaller::CalculatePatchSizeAsync] Computed patch size: {Size} bytes from {Count} krpdiff entries (version {Version})",
+                total, krpCount, currentVersion);
 
             return total > long.MaxValue ? long.MaxValue : (long)total;
         }
@@ -188,10 +205,12 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
         /// <summary>
         /// Builds the patch index URL from a patch config reference.
+        /// The IndexFile field is a full relative path from the CDN root
+        /// (e.g. "launcher/game/G153/.../indexFile.json"), so we prepend the
+        /// CDN base URL (ApiResponseAssetUrl) to form an absolute URI.
         /// </summary>
         private string? BuildPatchIndexUrl(WuwaApiResponseGameConfigRef patchConfig)
         {
-            string? baseUrl = patchConfig.BaseUrl ?? GameResourceBasisPath;
             string? indexFile = patchConfig.IndexFile;
 
             if (string.IsNullOrEmpty(indexFile))
@@ -201,11 +220,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 return null;
             }
 
-            if (!string.IsNullOrEmpty(baseUrl))
-                return $"{baseUrl.TrimEnd('/')}/{indexFile.TrimStart('/')}";
-
             if (!string.IsNullOrEmpty(ApiResponseAssetUrl))
-                return $"{ApiResponseAssetUrl}{indexFile}";
+                return $"{ApiResponseAssetUrl.TrimEnd('/')}/{indexFile.TrimStart('/')}";
 
             return null;
         }
@@ -413,6 +429,95 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     "[Patch::RunAsync] Found {KrpCount} krpdiff files to download out of {TotalCount} resources",
                     krpdiffEntries.Length, patchIndex.Resource.Length);
 
+                // ── Step 3b: Pre-flight validation ──
+                // Check whether the installed files already match the TARGET version's hashes.
+                // This handles the case where both version JSONs are stale (e.g. game updated
+                // externally) but all files on disk are already at the target version.
+                if (!onlyDownload && patchIndex.GroupInfos.Length > 0)
+                {
+                    bool allDestinationsMatch = true;
+                    int checkedCount = 0;
+
+                    foreach (var group in patchIndex.GroupInfos)
+                    {
+                        token.ThrowIfCancellationRequested();
+
+                        int pairCount = Math.Min(group.SrcFiles.Length, group.DstFiles.Length);
+                        for (int i = 0; i < pairCount; i++)
+                        {
+                            var dstRef = group.DstFiles[i];
+                            if (string.IsNullOrEmpty(dstRef.Dest) || string.IsNullOrEmpty(dstRef.Md5))
+                                continue;
+
+                            string dstPath = Path.Combine(installPath,
+                                dstRef.Dest.Replace('/', Path.DirectorySeparatorChar));
+
+                            if (!File.Exists(dstPath))
+                            {
+                                allDestinationsMatch = false;
+                                break;
+                            }
+
+                            // Size check first (cheap) — skip MD5 if size doesn't match
+                            var fi = new FileInfo(dstPath);
+                            if (dstRef.Size > 0 && (ulong)fi.Length != dstRef.Size)
+                            {
+                                allDestinationsMatch = false;
+                                break;
+                            }
+
+                            // MD5 check
+                            await using (var fs = File.OpenRead(dstPath))
+                            {
+                                string md5 = await WuwaUtils.ComputeMd5HexAsync(fs, token).ConfigureAwait(false);
+                                if (!string.Equals(md5, dstRef.Md5, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    allDestinationsMatch = false;
+                                    break;
+                                }
+                            }
+
+                            checkedCount++;
+                        }
+
+                        if (!allDestinationsMatch)
+                            break;
+                    }
+
+                    if (allDestinationsMatch && checkedCount > 0)
+                    {
+                        SharedStatic.InstanceLogger.LogInformation(
+                            "[Patch::RunAsync] Pre-flight check: all {Count} destination files already match " +
+                            "target version hashes. Files are up-to-date; skipping patch. Updating version only.",
+                            checkedCount);
+
+                        // Resolve target version and update
+                        GameVersion preflightTargetVer;
+                        if (kind == GameInstallerKind.Preload)
+                            manager.GetApiPreloadGameVersion(out preflightTargetVer);
+                        else
+                            manager.GetApiGameVersion(out preflightTargetVer);
+
+                        manager.SetCurrentGameVersion(preflightTargetVer);
+                        manager.SaveConfig();
+
+                        // Clean up any leftover preload temp files
+                        try
+                        {
+                            if (Directory.Exists(patchTempPath))
+                                Directory.Delete(patchTempPath, true);
+                        }
+                        catch { /* best-effort */ }
+
+                        progressStateDelegate?.Invoke(InstallProgressState.Completed);
+                        return;
+                    }
+
+                    SharedStatic.InstanceLogger.LogDebug(
+                        "[Patch::RunAsync] Pre-flight check: {Checked} files checked, not all match target. Proceeding with patch.",
+                        checkedCount);
+                }
+
                 // ── Step 4: Check for pre-downloaded files (preload scenario) ──
                 bool hasPredownloadedFiles = false;
                 if (!onlyDownload && Directory.Exists(patchTempPath))
@@ -460,8 +565,12 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     installProgress.DownloadedCount = 0;
                     ReportProgress();
 
-                    // Build the base download URL from the patch config
-                    string patchBaseUrl = (patchConfig.BaseUrl ?? _owner.GameResourceBasisPath ?? "").TrimEnd('/');
+                    // Build the absolute base download URL from the CDN host + patch config's baseUrl
+                    string patchRelativeBase = (patchConfig.BaseUrl ?? _owner.GameResourceBasisPath ?? "").TrimEnd('/');
+                    string cdnHost = (_owner.ApiResponseAssetUrl ?? "").TrimEnd('/');
+                    string patchBaseUrl = string.IsNullOrEmpty(cdnHost)
+                        ? patchRelativeBase
+                        : $"{cdnHost}/{patchRelativeBase.TrimStart('/')}";
 
                     Directory.CreateDirectory(patchTempPath);
 
