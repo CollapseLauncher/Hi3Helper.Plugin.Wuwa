@@ -7,6 +7,9 @@ public class WuwaApiResponseGameConfigDefinition
 {
     [JsonPropertyName("config")] // Mapping: root -> default -> config
     public WuwaApiResponseGameConfigRef? ConfigReference { get; set; }
+
+    [JsonPropertyName("predownload")] // Mapping: root -> default -> predownload
+    public WuwaApiResponseGameConfigRef? PredownloadReference { get; set; }
 }
 
 public class WuwaApiResponseGameConfig

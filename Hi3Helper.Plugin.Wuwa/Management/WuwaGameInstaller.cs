@@ -90,7 +90,9 @@ internal partial class WuwaGameInstaller : GameInstallerBase
         return gameInstallerKind switch
         {
             GameInstallerKind.None => 0L,
-            GameInstallerKind.Install or GameInstallerKind.Update or GameInstallerKind.Preload =>
+            GameInstallerKind.Update or GameInstallerKind.Preload =>
+                await CalculatePatchDownloadedBytesAsync(token).ConfigureAwait(false),
+            GameInstallerKind.Install =>
                 await CalculateDownloadedBytesAsync(token).ConfigureAwait(false),
             _ => 0L,
         };
@@ -103,6 +105,12 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 
         // Ensure API/init is ready
         await InitAsync(token).ConfigureAwait(false);
+
+        // For update/preload, compute from patch index instead of full resource index
+        if (gameInstallerKind is GameInstallerKind.Update or GameInstallerKind.Preload)
+        {
+            return await CalculatePatchSizeAsync(gameInstallerKind, token).ConfigureAwait(false);
+        }
 
         // Load index (cached)
         var index = await GetCachedIndexAsync(false, token).ConfigureAwait(false);
@@ -138,14 +146,14 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 
     protected override Task StartPreloadAsyncInner(InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
     {
-        // reuse install routine for preload but indicate kind Preload
-        return StartInstallCoreAsync(GameInstallerKind.Preload, progressDelegate, progressStateDelegate, token);
+        // Preload: download krpdiff files but do not apply them yet
+        return StartPatchCoreAsync(GameInstallerKind.Preload, onlyDownload: true, progressDelegate, progressStateDelegate, token);
     }
 
     protected override Task StartUpdateAsyncInner(InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
     {
-        // call shared routine with Update kind so we can detect and skip unchanged files
-        return StartInstallCoreAsync(GameInstallerKind.Update, progressDelegate, progressStateDelegate, token);
+        // Update: download and apply krpdiff patches (or use pre-downloaded preload files)
+        return StartPatchCoreAsync(GameInstallerKind.Update, onlyDownload: false, progressDelegate, progressStateDelegate, token);
     }
 
     // Delegate installation flow to the Install helper (defined in the separate partial file).
@@ -178,6 +186,50 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 
 	#region Helpers
 	// NOTE: ComputeMd5Hex has been moved to WuwaUtils.
+
+    private Task<long> CalculatePatchDownloadedBytesAsync(CancellationToken token)
+    {
+        try
+        {
+            GameManager.GetGamePath(out string? installPath);
+            if (string.IsNullOrEmpty(installPath))
+                return Task.FromResult(0L);
+
+            string patchTempPath = Path.Combine(installPath, "TempPath", PatchTempDirName);
+            if (!Directory.Exists(patchTempPath))
+                return Task.FromResult(0L);
+
+            long total = 0L;
+            foreach (string file in Directory.EnumerateFiles(patchTempPath, "*", SearchOption.AllDirectories))
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    var fi = new FileInfo(file);
+                    total += fi.Length;
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            SharedStatic.InstanceLogger.LogDebug(
+                "[WuwaGameInstaller::CalculatePatchDownloadedBytesAsync] Total patch bytes on disk: {Total}", total);
+            return Task.FromResult(total);
+        }
+        catch (OperationCanceledException)
+        {
+            return Task.FromResult(0L);
+        }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameInstaller::CalculatePatchDownloadedBytesAsync] Error: {Err}", ex.Message);
+            return Task.FromResult(0L);
+        }
+    }
+
 	private async Task<long> CalculateDownloadedBytesAsync(CancellationToken token)
     {
         // Downloaded size is calculated from files present in the installation directory.

@@ -496,11 +496,49 @@ internal partial class WuwaGameManager : GameManagerBase
             if (IsStandaloneInstall) return "standalone";
             if (IsSteamInstall) return "steam";
             if (IsEpicInstall) return "epic";
-        } 
-        catch 
-        { 
+        }
+        catch
+        {
             // ignore
         }
         return "unknown";
     }
+
+    /// <summary>
+    /// Finds a patch config entry that patches FROM the given version to the current API game version.
+    /// </summary>
+    internal WuwaApiResponseGameConfigRef? GetPatchConfigForVersion(GameVersion fromVersion)
+    {
+        var patchConfigs = ApiGameConfigResponse?.Default?.ConfigReference?.PatchConfig;
+        if (patchConfigs == null) return null;
+
+        foreach (var pc in patchConfigs)
+        {
+            if (pc.CurrentVersion == fromVersion)
+                return pc;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Finds a preload patch config entry that patches FROM the given version to the preload version.
+    /// </summary>
+    internal WuwaApiResponseGameConfigRef? GetPreloadPatchConfigForVersion(GameVersion fromVersion)
+    {
+        var patchConfigs = ApiGameConfigResponse?.Default?.PredownloadReference?.PatchConfig;
+        if (patchConfigs == null) return null;
+
+        foreach (var pc in patchConfigs)
+        {
+            if (pc.CurrentVersion == fromVersion)
+                return pc;
+        }
+        return null;
+    }
+
+    internal WuwaApiResponseGameConfigRef? ApiConfigReference
+        => ApiGameConfigResponse?.Default?.ConfigReference;
+
+    internal WuwaApiResponseGameConfigRef? ApiPredownloadReference
+        => ApiGameConfigResponse?.Default?.PredownloadReference;
 }
