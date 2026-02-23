@@ -63,31 +63,54 @@ internal partial class WuwaGlobalLauncherApiNews(string apiResponseBaseUrl, stri
                         "information",
                         "en.json");
 
+        // Fetch social and news independently so one failing doesn't block the other.
+        try
+        {
 #if !USELIGHTWEIGHTJSONPARSER
-        ApiResponseSocialMedia = await ApiResponseHttpClient
-               .GetApiResponseFromJsonAsync(
-                        requestSocialUrl,
-                        WuwaApiResponseContext.Default.WuwaApiResponseSocial,
-                        token);
-
-        ApiResponseNewsAndCarousel = await ApiResponseHttpClient
-               .GetApiResponseFromJsonAsync(
-                        requestNewsUrl,
-                        WuwaApiResponseContext.Default.WuwaApiResponseNews,
-                        token);
+            ApiResponseSocialMedia = await ApiResponseHttpClient
+                   .GetApiResponseFromJsonAsync(
+                            requestSocialUrl,
+                            WuwaApiResponseContext.Default.WuwaApiResponseSocial,
+                            token);
 #else
-        await using var socialStream = await ApiResponseHttpClient.GetStreamAsync(requestSocialUrl, token);
-        ApiResponseSocialMedia = await System.Text.Json.JsonSerializer.DeserializeAsync(
-                        socialStream,
-                        WuwaApiResponseContext.Default.WuwaApiResponseSocial,
-                        token);
-
-        await using var newsStream = await ApiResponseHttpClient.GetStreamAsync(requestNewsUrl, token);
-        ApiResponseNewsAndCarousel = await System.Text.Json.JsonSerializer.DeserializeAsync(
-                        newsStream,
-                        WuwaApiResponseContext.Default.WuwaApiResponseNews,
-                        token);
+            await using var socialStream = await ApiResponseHttpClient.GetStreamAsync(requestSocialUrl, token);
+            ApiResponseSocialMedia = await System.Text.Json.JsonSerializer.DeserializeAsync(
+                            socialStream,
+                            WuwaApiResponseContext.Default.WuwaApiResponseSocial,
+                            token);
 #endif
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGlobalLauncherApiNews::InitAsync] Failed to load social media entries: {Error}",
+                ex.Message);
+        }
+
+        try
+        {
+#if !USELIGHTWEIGHTJSONPARSER
+            ApiResponseNewsAndCarousel = await ApiResponseHttpClient
+                   .GetApiResponseFromJsonAsync(
+                            requestNewsUrl,
+                            WuwaApiResponseContext.Default.WuwaApiResponseNews,
+                            token);
+#else
+            await using var newsStream = await ApiResponseHttpClient.GetStreamAsync(requestNewsUrl, token);
+            ApiResponseNewsAndCarousel = await System.Text.Json.JsonSerializer.DeserializeAsync(
+                            newsStream,
+                            WuwaApiResponseContext.Default.WuwaApiResponseNews,
+                            token);
+#endif
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGlobalLauncherApiNews::InitAsync] Failed to load news/carousel entries: {Error}",
+                ex.Message);
+        }
 
         return 0;
     }
