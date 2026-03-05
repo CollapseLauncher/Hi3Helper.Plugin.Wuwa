@@ -18,6 +18,9 @@ public class WuwaApiResponseResourceEntry
     [JsonPropertyName("md5")]
     public string? Md5 { get; set; }
 
+    [JsonPropertyName("fromFolder")]
+    public string? FromFolder { get; set; }
+
     [JsonPropertyName("size")]
     [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
     public ulong Size { get; set; }

@@ -1611,6 +1611,19 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                 manager.SaveConfig();
 
+                // Write LocalGameResources.json so Kuro's launcher recognises the updated files
+                try
+                {
+                    var resourceIndex = await _owner.GetCachedIndexAsync(false, token).ConfigureAwait(false);
+                    if (resourceIndex != null)
+                        manager.TryWriteLocalGameResources(installPath, resourceIndex);
+                }
+                catch (Exception ex)
+                {
+                    SharedStatic.InstanceLogger.LogWarning(
+                        "[Patch::RunAsync] Failed to write LocalGameResources.json: {Err}", ex.Message);
+                }
+
                 currentProgressState = InstallProgressState.Completed;
                 ReportProgress();
                 SharedStatic.InstanceLogger.LogInformation(

@@ -600,6 +600,17 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     {
                         SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallCoreAsync] Failed to write app-game-config.json: {Err}", ex.Message);
                     }
+
+                    // Write LocalGameResources.json so Kuro's launcher recognises the installed files
+                    try
+                    {
+                        if (_owner.GameManager is WuwaGameManager gmRes)
+                            gmRes.TryWriteLocalGameResources(installPath, index);
+                    }
+                    catch (Exception ex)
+                    {
+                        SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallCoreAsync] Failed to write LocalGameResources.json: {Err}", ex.Message);
+                    }
                 }
                 catch (Exception ex)
                 {

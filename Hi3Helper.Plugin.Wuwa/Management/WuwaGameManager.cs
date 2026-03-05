@@ -741,6 +741,9 @@ internal partial class WuwaGameManager : GameManagerBase
             SharedStatic.InstanceLogger.LogWarning(
                 "[WuwaGameManager::SaveConfig] Failed to write app-game-config.json: {Exception}", ex);
         }
+
+        // Keep launcherDownloadConfig.json in sync with the version we just persisted.
+        TryUpdateLauncherDownloadConfig(CurrentGameInstallPath, CurrentGameVersion.ToString());
     }
 
     internal string GetInstallType()
@@ -756,6 +759,102 @@ internal partial class WuwaGameManager : GameManagerBase
             // ignore
         }
         return "unknown";
+    }
+
+    /// <summary>
+    /// Writes (or updates) <c>launcherDownloadConfig.json</c> in the game install directory
+    /// with the supplied <paramref name="version"/>. If the file already exists its other
+    /// fields (e.g. <c>appId</c>) are preserved; only <c>version</c> is changed.
+    /// </summary>
+    internal void TryUpdateLauncherDownloadConfig(string installPath, string version)
+    {
+        const string fileName = "launcherDownloadConfig.json";
+        string configPath = Path.Combine(installPath, fileName);
+
+        // Start from any existing data so we preserve fields like appId.
+        var cfg = new WuwaLauncherDownloadConfig
+        {
+            Version      = version,
+            ReUseVersion = string.Empty,
+            State        = string.Empty,
+            IsPreDownload = false,
+        };
+
+        if (File.Exists(configPath))
+        {
+            try
+            {
+                using var readFs = File.OpenRead(configPath);
+                var existing = JsonSerializer.Deserialize(readFs,
+                    WuwaApiResponseContext.Default.WuwaLauncherDownloadConfig);
+                if (existing != null)
+                {
+                    // Carry over fields we don't want to overwrite.
+                    cfg.AppId         = existing.AppId;
+                    cfg.ReUseVersion  = existing.ReUseVersion ?? string.Empty;
+                    cfg.State         = existing.State         ?? string.Empty;
+                    cfg.IsPreDownload = false; // always clear the pre-download flag after a full update
+                }
+            }
+            catch (Exception ex)
+            {
+                SharedStatic.InstanceLogger.LogWarning(
+                    "[WuwaGameManager::TryUpdateLauncherDownloadConfig] Could not read existing {File}: {Err}",
+                    fileName, ex.Message);
+            }
+        }
+
+        try
+        {
+            string tempPath = configPath + ".tmp";
+            using (var writeFs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(writeFs, cfg,
+                    WuwaApiResponseContext.Default.WuwaLauncherDownloadConfig);
+            }
+            File.Move(tempPath, configPath, overwrite: true);
+            SharedStatic.InstanceLogger.LogInformation(
+                "[WuwaGameManager::TryUpdateLauncherDownloadConfig] Updated {File} → version={Version}",
+                fileName, version);
+        }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameManager::TryUpdateLauncherDownloadConfig] Failed to write {File}: {Err}",
+                fileName, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Writes <c>LocalGameResources.json</c> to the game install directory using the
+    /// supplied resource index. This mirrors the file that Kuro's official launcher
+    /// maintains so the game and launcher remain in sync after installs/updates done
+    /// through Collapse Launcher.
+    /// </summary>
+    internal void TryWriteLocalGameResources(string installPath, WuwaApiResponseResourceIndex index)
+    {
+        const string fileName = "LocalGameResources.json";
+        string configPath = Path.Combine(installPath, fileName);
+
+        try
+        {
+            string tempPath = configPath + ".tmp";
+            using (var writeFs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(writeFs, index,
+                    WuwaApiResponseContext.Default.WuwaApiResponseResourceIndex);
+            }
+            File.Move(tempPath, configPath, overwrite: true);
+            SharedStatic.InstanceLogger.LogInformation(
+                "[WuwaGameManager::TryWriteLocalGameResources] Wrote {File} ({Count} entries)",
+                fileName, index.Resource.Length);
+        }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameManager::TryWriteLocalGameResources] Failed to write {File}: {Err}",
+                fileName, ex.Message);
+        }
     }
 
     /// <summary>
