@@ -337,7 +337,9 @@ internal partial class WuwaGameManager : GameManagerBase
         configMessage.EnsureSuccessStatusCode();
 
         string jsonResponse = await configMessage.Content.ReadAsStringAsync(token);
+#if DEBUG
         SharedStatic.InstanceLogger.LogTrace("API Game Config response: {JsonResponse}", jsonResponse);
+#endif
         WuwaApiResponseGameConfig? tmp = JsonSerializer.Deserialize<WuwaApiResponseGameConfig>(jsonResponse,
             WuwaApiResponseContext.Default.WuwaApiResponseGameConfig);
         ApiGameConfigResponse = tmp ?? throw new JsonException("Failed to deserialize API game config response.");
