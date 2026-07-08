@@ -1,5 +1,7 @@
-﻿using Hi3Helper.Plugin.Core.Utility;
+﻿using Hi3Helper.Plugin.Core;
+using Hi3Helper.Plugin.Core.Utility;
 using Hi3Helper.Plugin.Wuwa.Management.PresetConfig;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Diagnostics;
 using System.Linq;
@@ -84,5 +86,78 @@ public partial class Exports
 		{
 			EpicProcesses = [];
 		}
+	}
+
+	/// <summary>
+	/// For Epic, the protocol URL already launches the game.  Instead of starting
+	/// the executable ourselves (which would create a duplicate instance), wait for
+	/// the game process to appear and then monitor it until it exits.
+	/// </summary>
+	private async Task<bool> WaitForEpicGameProcessAsync(
+		GameManagerExtension.RunGameFromGameManagerContext context,
+		bool isRunBoosted,
+		ProcessPriorityClass processPriority,
+		CancellationToken token)
+	{
+		// Poll for the actual game process (Client-Win64-Shipping.exe).
+		if (!TryGetGameExecutablePath(context, out string? gameExecutablePath))
+		{
+			SharedStatic.InstanceLogger.LogError(
+				"[Wuwa::WaitForEpicGameProcessAsync] Failed to resolve game executable path.");
+			return false;
+		}
+
+		SharedStatic.InstanceLogger.LogInformation(
+			"[Wuwa::WaitForEpicGameProcessAsync] Waiting for game process: {Path}", gameExecutablePath);
+
+		const int maxWaitMs = 60000; // up to 60s for Epic to launch the game
+		const int pollIntervalMs = 500;
+		int elapsed = 0;
+		Process? gameProcess = null;
+
+		while (elapsed < maxWaitMs)
+		{
+			token.ThrowIfCancellationRequested();
+			gameProcess = FindExecutableProcess(gameExecutablePath);
+			if (gameProcess != null)
+				break;
+			await Task.Delay(pollIntervalMs, token);
+			elapsed += pollIntervalMs;
+		}
+
+		if (gameProcess == null)
+		{
+			SharedStatic.InstanceLogger.LogWarning(
+				"[Wuwa::WaitForEpicGameProcessAsync] Game process did not appear within {MaxWait}ms.", maxWaitMs);
+			_ = TryKillEpicLauncher(context, token);
+			return false;
+		}
+
+		using (gameProcess)
+		{
+			SharedStatic.InstanceLogger.LogInformation(
+				"[Wuwa::WaitForEpicGameProcessAsync] Found game process PID={Pid}", gameProcess.Id);
+
+			try
+			{
+				gameProcess.PriorityBoostEnabled = isRunBoosted;
+				gameProcess.PriorityClass = processPriority;
+			}
+			catch (Exception e)
+			{
+				InstanceLogger.LogError(e, "[Wuwa::WaitForEpicGameProcessAsync] Failed to set process priority, ignoring.");
+			}
+
+			CancellationTokenSource gameLogReaderCts = new();
+			CancellationTokenSource coopCts = CancellationTokenSource.CreateLinkedTokenSource(token, gameLogReaderCts.Token);
+
+			_ = ReadGameLog(context, coopCts.Token);
+			_ = TryKillEpicLauncher(context, token);
+
+			await gameProcess.WaitForExitAsync(token);
+			await gameLogReaderCts.CancelAsync();
+		}
+
+		return true;
 	}
 }

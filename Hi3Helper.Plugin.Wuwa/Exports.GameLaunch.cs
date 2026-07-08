@@ -16,6 +16,14 @@ namespace Hi3Helper.Plugin.Wuwa;
 
 public partial class Exports
 {
+	/// <summary>
+	/// Set to true while the game is being launched and the real game process may not
+	/// have appeared yet.  Keeps <see cref="IsGameRunningCore"/> returning true so
+	/// that the Collapse polling loop does not exit prematurely during the
+	/// wrapper -> game-executable hand-off.
+	/// </summary>
+	private volatile bool _isGameLaunching;
+
 	/// <inheritdoc/>
 	protected override (bool IsSupported, Task<bool> Task) LaunchGameFromGameManagerCoreAsync(GameManagerExtension.RunGameFromGameManagerContext context, string? startArgument, bool isRunBoosted, ProcessPriorityClass processPriority, CancellationToken token)
 	{
@@ -23,46 +31,63 @@ public partial class Exports
 
 		async Task<bool> Impl()
 		{
-			if (!await TryInitializeEpicLauncher(context, token))
+			_isGameLaunching = true;
+			try
 			{
-				return false;
-			}
+				bool isEpic = context.PresetConfig is WuwaEpicPresetConfig;
 
-			if (!await TryInitializeSteamLauncher(context, token))
-			{
-				return false;
-			}
-
-			if (!TryGetStartingProcessFromContext(context, startArgument, out Process? process))
-			{
-				return false;
-			}
-
-			using (process)
-			{
-				process.Start();
-
-				try
+				if (!await TryInitializeEpicLauncher(context, token))
 				{
-					process.PriorityBoostEnabled = isRunBoosted;
-					process.PriorityClass = processPriority;
-				}
-				catch (Exception e)
-				{
-					InstanceLogger.LogError(e, "[Wuwa::LaunchGameFromGameManagerCoreAsync()] An error has occurred while trying to set process priority, Ignoring!");
+					return false;
 				}
 
-				CancellationTokenSource gameLogReaderCts = new();
-				CancellationTokenSource coopCts = CancellationTokenSource.CreateLinkedTokenSource(token, gameLogReaderCts.Token);
+				if (!await TryInitializeSteamLauncher(context, token))
+				{
+					return false;
+				}
 
-				// Run game log reader (Create a new thread)
-				_ = ReadGameLog(context, coopCts.Token);
+				// Epic protocol URL already launches the game so starting the wrapper
+				// ourselves would create a duplicate instance (black-screen /
+				// "connection issues" dialog). Instead, we wait for the real game
+				// process to appear and monitor it.
+				if (isEpic)
+				{
+					return await WaitForEpicGameProcessAsync(context, isRunBoosted, processPriority, token);
+				}
 
-				_ = TryKillEpicLauncher(context, token);
+				if (!TryGetStartingProcessFromContext(context, startArgument, out Process? process))
+				{
+					return false;
+				}
 
-				await process.WaitForExitAsync(token);
-				await gameLogReaderCts.CancelAsync();
-				return true;
+				using (process)
+				{
+					process.Start();
+
+					try
+					{
+						process.PriorityBoostEnabled = isRunBoosted;
+						process.PriorityClass = processPriority;
+					}
+					catch (Exception e)
+					{
+						InstanceLogger.LogError(e, "[Wuwa::LaunchGameFromGameManagerCoreAsync()] An error has occurred while trying to set process priority, Ignoring!");
+					}
+
+					CancellationTokenSource gameLogReaderCts = new();
+					CancellationTokenSource coopCts = CancellationTokenSource.CreateLinkedTokenSource(token, gameLogReaderCts.Token);
+
+					// Run game log reader (Create a new thread)
+					_ = ReadGameLog(context, coopCts.Token);
+
+					await process.WaitForExitAsync(token);
+					await gameLogReaderCts.CancelAsync();
+					return true;
+				}
+			}
+			finally
+			{
+				_isGameLaunching = false;
 			}
 		}
 	}
@@ -83,7 +108,7 @@ public partial class Exports
 
 		using Process? process = FindExecutableProcess(startingExecutablePath);
 		using Process? gameProcess = FindExecutableProcess(gameExecutablePath);
-		isGameRunning = process != null || gameProcess != null || IsEpicLoading || IsSteamLoading;
+		isGameRunning = process != null || gameProcess != null || IsEpicLoading || IsSteamLoading || _isGameLaunching;
 		gameStartTime = process?.StartTime ?? gameProcess?.StartTime ?? EpicStartTime ?? SteamStartTime ?? default;
 
 		return true;
@@ -114,13 +139,32 @@ public partial class Exports
 				return true;
 			}
 
-			using Process? process = FindExecutableProcess(startingExecutablePath);
-			using Process? gameProcess = FindExecutableProcess(gameExecutablePath);
+			// The launcher wrapper (Wuthering Waves.exe) typically exits quickly
+			// after spawning Client-Win64-Shipping.exe. Poll for a few seconds
+			// to give the real game process time to appear.
+			const int maxRetryMs = 15000;
+			const int retryIntervalMs = 500;
+			int elapsed = 0;
 
-			if (gameProcess != null)
-				await gameProcess.WaitForExitAsync(token);
-			else if (process != null)
-				await process.WaitForExitAsync(token);
+			Process? process = FindExecutableProcess(startingExecutablePath);
+			Process? gameProcess = FindExecutableProcess(gameExecutablePath);
+
+			while (process == null && gameProcess == null && elapsed < maxRetryMs)
+			{
+				await Task.Delay(retryIntervalMs, token);
+				elapsed += retryIntervalMs;
+				process = FindExecutableProcess(startingExecutablePath);
+				gameProcess = FindExecutableProcess(gameExecutablePath);
+			}
+
+			using (process)
+			using (gameProcess)
+			{
+				if (gameProcess != null)
+					await gameProcess.WaitForExitAsync(token);
+				else if (process != null)
+					await process.WaitForExitAsync(token);
+			}
 
 			return true;
 		}
