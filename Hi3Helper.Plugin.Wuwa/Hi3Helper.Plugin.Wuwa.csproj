@@ -17,8 +17,8 @@
 		<AssemblyTitle>Wuthering Waves Plugin</AssemblyTitle>
 		<Company>Collapse Launcher Team</Company>
 		<Authors>$(Company). neon-nyan, Cry0, bagusnl, shatyuka, gablm.</Authors>
-		<Copyright>Copyright 2022-2025 $(Company)</Copyright>
-		<Version>0.6.3</Version>
+		<Copyright>Copyright 2022-2026 $(Company)</Copyright>
+		<Version>0.6.4</Version>
 		<ApplicationIcon>icon.ico</ApplicationIcon>
         <Configurations>Debug;Release;DebugNoReflection;ReleaseNoReflection</Configurations>
     </PropertyGroup>
