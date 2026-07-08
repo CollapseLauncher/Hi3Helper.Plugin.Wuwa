@@ -257,6 +257,12 @@ internal partial class WuwaGameInstaller : GameInstallerBase
             foreach (string file in files)
             {
                 token.ThrowIfCancellationRequested();
+
+                string fileName = Path.GetFileName(file);
+                // Metadata markers are not part of the patch manifest byte total.
+                if (fileName.StartsWith(".", StringComparison.Ordinal))
+                    continue;
+
                 try
                 {
                     var fi = new FileInfo(file);
