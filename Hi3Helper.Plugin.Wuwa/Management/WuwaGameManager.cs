@@ -383,6 +383,13 @@ internal partial class WuwaGameManager : GameManagerBase
             ApiPreloadGameVersion = GameVersion.Empty;
         }
 
+        // Re-check Kuro's launcherDownloadConfig.json now that the live API version is known.
+        TryCrossCheckKuroLauncherVersion();
+
+        // If metadata is still stale but on-disk files already match the target version
+        // (e.g. game updated via the official Kuro launcher), sync local version only.
+        await TrySyncVersionFromExternalUpdateAsync(token).ConfigureAwait(false);
+
         return 0;
     }
 
@@ -646,23 +653,35 @@ internal partial class WuwaGameManager : GameManagerBase
             }
 
             GameVersion currentVersion = CurrentGameVersion;
+            GameVersion syncVersion = GameVersion.Empty;
+
             if (kuroVersion > currentVersion)
+                syncVersion = kuroVersion;
+
+            // When the live API agrees with Kuro's version, prefer the API value so both
+            // metadata sources stay aligned after an external official-launcher update.
+            if (IsInitialized && ApiGameVersion != GameVersion.Empty &&
+                kuroVersion == ApiGameVersion && ApiGameVersion > currentVersion)
+            {
+                syncVersion = ApiGameVersion;
+            }
+
+            if (syncVersion != GameVersion.Empty)
             {
                 SharedStatic.InstanceLogger.LogInformation(
                     "[WuwaGameManager::TryCrossCheckKuroLauncherVersion] Kuro launcher reports version {KuroVer} " +
-                    "which is newer than app-game-config version {CurVer}. " +
-                    "Game was likely updated externally. Updating local version.",
-                    kuroVersion, currentVersion);
+                    "(API={ApiVer}, local={CurVer}). Game was likely updated externally. Updating local version to {SyncVer}.",
+                    kuroVersion, ApiGameVersion, currentVersion, syncVersion);
 
-                CurrentGameVersion = kuroVersion;
+                CurrentGameVersion = syncVersion;
                 SaveConfig();
             }
             else
             {
                 SharedStatic.InstanceLogger.LogDebug(
                     "[WuwaGameManager::TryCrossCheckKuroLauncherVersion] Versions match or app-game-config is newer. " +
-                    "Kuro={KuroVer}, Local={CurVer}. No action needed.",
-                    kuroVersion, currentVersion);
+                    "Kuro={KuroVer}, API={ApiVer}, Local={CurVer}. No action needed.",
+                    kuroVersion, ApiGameVersion, currentVersion);
             }
         }
         catch (Exception ex)
@@ -670,6 +689,36 @@ internal partial class WuwaGameManager : GameManagerBase
             SharedStatic.InstanceLogger.LogWarning(
                 "[WuwaGameManager::TryCrossCheckKuroLauncherVersion] Failed to read {File}: {Err}",
                 kuroConfigFileName, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// When version metadata is stale but installed files already match the live API target,
+    /// sync <c>app-game-config.json</c> without requiring a full patch download.
+    /// </summary>
+    private async Task TrySyncVersionFromExternalUpdateAsync(CancellationToken token)
+    {
+        if (!IsInstalled || DEBUG_AllowDowngrade || DEBUG_SkipPreflight || HasPendingPreloadPatch)
+            return;
+
+        if (ApiGameVersion == GameVersion.Empty || ApiGameVersion == CurrentGameVersion)
+            return;
+
+        WuwaGameInstaller? syncInstaller = null;
+        try
+        {
+            syncInstaller = new WuwaGameInstaller(this);
+            await syncInstaller.TrySyncVersionFromExternalUpdateAsync(token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameManager::TrySyncVersionFromExternalUpdateAsync] Disk version sync failed (non-fatal): {Err}",
+                ex.Message);
+        }
+        finally
+        {
+            syncInstaller?.Dispose();
         }
     }
 
