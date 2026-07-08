@@ -355,6 +355,10 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             await TryDownloadChunkedFileWithFallbacksAsync(fileUri, outputPath, entry.ChunkInfos, entry.Dest ?? string.Empty, innerToken, EntryBytesCallback).ConfigureAwait(false);
                         }
                     }
+                    catch (Exception ex) when (ex is OperationCanceledException)
+                    {
+                        throw;
+                    }
                     catch (Exception ex)
                     {
                         SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallCoreAsync] Download failed for {Dest}: {Err}", entry.Dest, ex.Message);
@@ -367,6 +371,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     Interlocked.Increment(ref installProgress.DownloadedCount);
                     ReportProgress(InstallProgressState.Download);
                 });
+                token.ThrowIfCancellationRequested();
                 #endregion
 
                 #region Verification Phase
@@ -467,6 +472,10 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                 Interlocked.Increment(ref installProgress.DownloadedCount);
                                 ReportProgress(InstallProgressState.Download);
                             }
+                            catch (Exception ex) when (ex is OperationCanceledException)
+                            {
+                                throw;
+                            }
                             catch (Exception ex)
                             {
                                 SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallCoreAsync] Retry download failed for {Dest}: {Err}", entry.Dest, ex.Message);
@@ -527,6 +536,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         }
                     }
                 }
+                token.ThrowIfCancellationRequested();
                 #endregion
 
                 #region Install / Extraction Phase (move temp -> final)
