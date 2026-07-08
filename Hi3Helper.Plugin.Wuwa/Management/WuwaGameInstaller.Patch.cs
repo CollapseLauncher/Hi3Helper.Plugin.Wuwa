@@ -84,6 +84,16 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 return 0L;
             }
 
+            // Preload estimates download size from the patch manifest, not from whether
+            // installed game files already match the future target version.
+            if (kind != GameInstallerKind.Preload)
+            {
+                long preflightAdjustedSize = await TryGetPreflightAdjustedPatchSizeAsync(
+                    manager, kind, patchIndex, currentVersion, token).ConfigureAwait(false);
+                if (preflightAdjustedSize >= 0)
+                    return preflightAdjustedSize;
+            }
+
             ulong total = 0;
             int krpCount = 0;
             int fullCount = 0;
@@ -115,6 +125,114 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 total, krpCount, fullCount, currentVersion);
 
             return total > long.MaxValue ? long.MaxValue : (long)total;
+        }
+
+        /// <summary>
+        /// Runs a lightweight pre-flight check when estimating patch size. Returns 0 when
+        /// installed files already match the target (and syncs local version metadata),
+        /// or -1 when the caller should fall back to summing the full patch index.
+        /// </summary>
+        private async Task<long> TryGetPreflightAdjustedPatchSizeAsync(
+            WuwaGameManager manager,
+            GameInstallerKind kind,
+            WuwaApiResponsePatchIndex patchIndex,
+            GameVersion currentVersion,
+            CancellationToken token)
+        {
+            if (manager.DEBUG_SkipPreflight || patchIndex.GroupInfos.Length == 0)
+                return -1;
+
+            manager.GetGamePath(out string? installPath);
+            if (string.IsNullOrEmpty(installPath))
+                return -1;
+
+            var preflight = await WuwaPatchPreflight.VerifyInstalledFilesAsync(
+                installPath, patchIndex, token).ConfigureAwait(false);
+
+            if (!WuwaPatchPreflight.AllFilesMatch(preflight))
+            {
+                SharedStatic.InstanceLogger.LogDebug(
+                    "[WuwaGameInstaller::CalculatePatchSizeAsync] Pre-flight: {Mismatched}/{Checked} files need patching; using full patch index size.",
+                    preflight.MismatchedDstFiles.Count, preflight.CheckedCount);
+                return -1;
+            }
+
+            GameVersion targetVersion;
+            if (kind == GameInstallerKind.Preload)
+                manager.GetApiPreloadGameVersion(out targetVersion);
+            else
+                manager.GetApiGameVersion(out targetVersion);
+
+            SharedStatic.InstanceLogger.LogInformation(
+                "[WuwaGameInstaller::CalculatePatchSizeAsync] Pre-flight: all {Count} files already match target {Target}. " +
+                "Syncing local version and reporting 0 bytes download.",
+                preflight.CheckedCount, targetVersion);
+
+            manager.SetCurrentGameVersion(targetVersion);
+            manager.SaveConfig();
+            return 0L;
+        }
+
+        /// <summary>
+        /// Detects when the game was updated externally and installed files already match
+        /// the live API target version, then syncs local version metadata without downloading.
+        /// </summary>
+        internal async Task TrySyncVersionFromExternalUpdateAsync(CancellationToken token)
+        {
+            var manager = GameManager as WuwaGameManager;
+            if (manager == null)
+                return;
+
+            manager.IsGameInstalled(out bool isInstalled);
+            if (!isInstalled || manager.DEBUG_AllowDowngrade || manager.DEBUG_SkipPreflight ||
+                manager.HasPendingPreloadPatch)
+            {
+                return;
+            }
+
+            manager.GetApiGameVersion(out GameVersion apiVersion);
+            manager.GetCurrentGameVersion(out GameVersion currentVersion);
+            if (apiVersion == GameVersion.Empty || apiVersion == currentVersion)
+                return;
+
+            var patchConfig = manager.GetPatchConfigForVersion(currentVersion);
+            if (patchConfig == null)
+            {
+                SharedStatic.InstanceLogger.LogDebug(
+                    "[WuwaGameInstaller::TrySyncVersionFromExternalUpdateAsync] No patch config for {Version}, skipping disk sync.",
+                    currentVersion);
+                return;
+            }
+
+            string? patchIndexUrl = BuildPatchIndexUrl(patchConfig);
+            if (string.IsNullOrEmpty(patchIndexUrl))
+                return;
+
+            var patchIndex = await DownloadPatchIndexAsync(patchIndexUrl, token).ConfigureAwait(false);
+            if (patchIndex == null || patchIndex.GroupInfos.Length == 0)
+                return;
+
+            manager.GetGamePath(out string? installPath);
+            if (string.IsNullOrEmpty(installPath))
+                return;
+
+            var preflight = await WuwaPatchPreflight.VerifyInstalledFilesAsync(
+                installPath, patchIndex, token).ConfigureAwait(false);
+
+            if (!WuwaPatchPreflight.AllFilesMatch(preflight))
+            {
+                SharedStatic.InstanceLogger.LogDebug(
+                    "[WuwaGameInstaller::TrySyncVersionFromExternalUpdateAsync] {Mismatched}/{Checked} files differ from target; update still required.",
+                    preflight.MismatchedDstFiles.Count, preflight.CheckedCount);
+                return;
+            }
+
+            SharedStatic.InstanceLogger.LogInformation(
+                "[WuwaGameInstaller::TrySyncVersionFromExternalUpdateAsync] All {Count} files match target {Target}. Syncing local version metadata.",
+                preflight.CheckedCount, apiVersion);
+
+            manager.SetCurrentGameVersion(apiVersion);
+            manager.SaveConfig();
         }
 
         /// <summary>
@@ -1256,6 +1374,150 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     ? fallbackRelativeBase
                     : $"{fallbackCdnHost}/{fallbackRelativeBase.TrimStart('/')}";
 
+                var resourceDestLookup = new Dictionary<string, WuwaApiResponseResourceEntry>(
+                    StringComparer.OrdinalIgnoreCase);
+                foreach (var entry in patchIndex.Resource)
+                {
+                    if (string.IsNullOrEmpty(entry.Dest))
+                        continue;
+                    if (entry.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    resourceDestLookup.TryAdd(entry.Dest, entry);
+                }
+
+                async Task DownloadReplacementFromCdnAsync(
+                    WuwaApiResponsePatchFileRef dstRef,
+                    bool updateGlobalProgress = true)
+                {
+                    if (string.IsNullOrEmpty(dstRef.Dest))
+                        return;
+
+                    string dstRelative = dstRef.Dest.Replace('/', Path.DirectorySeparatorChar);
+                    string finalDst = Path.Combine(installPath, dstRelative);
+
+                    resourceDestLookup.TryGetValue(dstRef.Dest, out WuwaApiResponseResourceEntry? resourceEntry);
+
+                    string expectedMd5 = resourceEntry?.Md5 ?? dstRef.Md5 ?? "";
+                    ulong expectedSize = resourceEntry is { Size: > 0 } ? resourceEntry.Size : dstRef.Size;
+                    WuwaApiResponseResourceChunkInfo[]? chunkInfos = resourceEntry?.ChunkInfos;
+
+                    if (!string.IsNullOrEmpty(resourceEntry?.Md5) && !string.IsNullOrEmpty(dstRef.Md5)
+                        && !string.Equals(resourceEntry.Md5, dstRef.Md5, StringComparison.OrdinalIgnoreCase))
+                    {
+                        SharedStatic.InstanceLogger.LogWarning(
+                            "[Patch::RunAsync] Resource index MD5 differs from patch group for {Dest}: " +
+                            "patch={PatchMd5}, resource={ResourceMd5}. Using resource index for CDN verify.",
+                            dstRef.Dest, dstRef.Md5, resourceEntry.Md5);
+                    }
+
+                    if (!string.IsNullOrEmpty(expectedMd5) && File.Exists(finalDst))
+                    {
+                        var existFi = new FileInfo(finalDst);
+                        if (expectedSize > 0 && (ulong)existFi.Length == expectedSize)
+                        {
+                            await using var existStream = File.OpenRead(finalDst);
+                            string existMd5 = await WuwaUtils
+                                .ComputeMd5HexAsync(existStream, token)
+                                .ConfigureAwait(false);
+                            if (string.Equals(existMd5, expectedMd5, StringComparison.OrdinalIgnoreCase))
+                            {
+                                SharedStatic.InstanceLogger.LogDebug(
+                                    "[Patch::RunAsync] Dest already at target, skip download: {Dst}",
+                                    dstRef.Dest);
+                                if (updateGlobalProgress)
+                                {
+                                    Interlocked.Increment(ref installProgress.StateCount);
+                                    Interlocked.Add(ref installProgress.DownloadedBytes, (long)expectedSize);
+                                    Interlocked.Increment(ref installProgress.DownloadedCount);
+                                    ReportProgress();
+                                }
+                                return;
+                            }
+                        }
+                    }
+
+                    string encodedDest = EncodePathSegments(dstRef.Dest);
+                    string fileUrl = $"{fallbackBaseUrl}/{encodedDest}";
+                    Uri uri = new(fileUrl, UriKind.Absolute);
+
+                    string? dstDir = Path.GetDirectoryName(finalDst);
+                    if (!string.IsNullOrEmpty(dstDir))
+                        Directory.CreateDirectory(dstDir);
+
+                    SharedStatic.InstanceLogger.LogDebug(
+                        "[Patch::RunAsync] Downloading replacement: {Url} (size={Size}, chunked={Chunked})",
+                        fileUrl, expectedSize, chunkInfos is { Length: > 0 });
+
+                    long replacementAccum = 0;
+                    long replacementTotal = (long)expectedSize;
+
+                    Action<long> progressCallback = bytes =>
+                    {
+                        if (updateGlobalProgress)
+                            Interlocked.Add(ref installProgress.DownloadedBytes, bytes);
+                        long currentBytes = Interlocked.Add(ref replacementAccum, bytes);
+                        SharedStaticV1Ext.InvokePerFileProgress(currentBytes, replacementTotal);
+                        if (updateGlobalProgress)
+                            ReportProgress();
+                    };
+
+                    if (chunkInfos is { Length: > 0 })
+                    {
+                        await _owner.TryDownloadChunkedFileWithFallbacksAsync(
+                            uri, finalDst, chunkInfos, dstRef.Dest, token, progressCallback)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await _owner.TryDownloadWholeFileWithFallbacksAsync(
+                            uri, finalDst, dstRef.Dest, token, progressCallback)
+                            .ConfigureAwait(false);
+                    }
+
+                    if (!string.IsNullOrEmpty(expectedMd5))
+                    {
+                        await using var dlStream = File.OpenRead(finalDst);
+                        string dlMd5 = await WuwaUtils
+                            .ComputeMd5HexAsync(dlStream, token)
+                            .ConfigureAwait(false);
+                        var dlFi = new FileInfo(finalDst);
+                        if (!string.Equals(dlMd5, expectedMd5, StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new InvalidOperationException(
+                                $"Downloaded replacement file MD5 mismatch for {dstRef.Dest}: " +
+                                $"expected={expectedMd5}, computed={dlMd5}, url={fileUrl}, " +
+                                $"size={dlFi.Length}, patchMd5={dstRef.Md5}, resourceMd5={resourceEntry?.Md5}");
+                        }
+                    }
+
+                    if (updateGlobalProgress)
+                    {
+                        Interlocked.Increment(ref installProgress.StateCount);
+                        Interlocked.Increment(ref installProgress.DownloadedCount);
+                        ReportProgress();
+                    }
+                }
+
+                async Task DownloadGroupDestinationsFromCdnAsync(
+                    int groupIdx,
+                    WuwaApiResponsePatchGroupInfo group,
+                    string logMessage,
+                    int? restoreStateCountBefore = null)
+                {
+                    SharedStatic.InstanceLogger.LogWarning(
+                        "[Patch::RunAsync] Group {Idx}: {Message}",
+                        groupIdx, logMessage);
+
+                    if (restoreStateCountBefore.HasValue)
+                        Interlocked.Exchange(ref installProgress.StateCount, restoreStateCountBefore.Value);
+
+                    foreach (var dstRef in group.DstFiles)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        await DownloadReplacementFromCdnAsync(dstRef).ConfigureAwait(false);
+                    }
+                }
+
                 if (patchIndex.GroupInfos.Length > 0)
                 {
                     currentProgressState = InstallProgressState.Updating;
@@ -1313,30 +1575,9 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                         // ─ Resume check: if ALL destination files already have the
                         //   correct size + MD5, the group was fully applied previously. ─
-                        bool allDstMatch = true;
-                        foreach (var dstRef in group.DstFiles)
-                        {
-                            if (string.IsNullOrEmpty(dstRef.Dest) || string.IsNullOrEmpty(dstRef.Md5))
-                                continue;
-
-                            string dstPath = Path.Combine(installPath,
-                                dstRef.Dest.Replace('/', Path.DirectorySeparatorChar));
-
-                            if (!File.Exists(dstPath))
-                            { allDstMatch = false; break; }
-
-                            var fi = new FileInfo(dstPath);
-                            if (fi.Length != (long)dstRef.Size)
-                            { allDstMatch = false; break; }
-
-                            await using var existingStream = File.OpenRead(dstPath);
-                            string existingMd5 = await WuwaUtils
-                                .ComputeMd5HexAsync(existingStream, token)
-                                .ConfigureAwait(false);
-                            if (!string.Equals(existingMd5, dstRef.Md5,
-                                    StringComparison.OrdinalIgnoreCase))
-                            { allDstMatch = false; break; }
-                        }
+                        bool allDstMatch = await WuwaPatchPreflight
+                            .GroupDestinationsMatchAsync(installPath, group, token)
+                            .ConfigureAwait(false);
 
                         if (allDstMatch)
                         {
@@ -1389,93 +1630,37 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                         if (badSrcFiles.Count > 0)
                         {
-                            SharedStatic.InstanceLogger.LogWarning(
-                                "[Patch::RunAsync] Group {Idx}: {Count} source file(s) missing or wrong size — " +
-                                "downloading destination files directly as full replacement.",
-                                groupIdx, badSrcFiles.Count);
+                            if (await WuwaPatchPreflight
+                                    .GroupDestinationsMatchAsync(installPath, group, token)
+                                    .ConfigureAwait(false))
+                            {
+                                SharedStatic.InstanceLogger.LogInformation(
+                                    "[Patch::RunAsync] Group {Idx}: {BadCount} source file(s) missing or wrong size, " +
+                                    "but all destination files already match target — skipping group.",
+                                    groupIdx, badSrcFiles.Count);
+                                foreach (var m in badSrcFiles)
+                                    SharedStatic.InstanceLogger.LogDebug(
+                                        "[Patch::RunAsync]   Bad source: {File}", m);
+
+                                cumulativeExpectedBytes += groupExpectedBytes;
+                                Interlocked.Exchange(ref installProgress.DownloadedBytes, cumulativeExpectedBytes);
+                                foreach (var dstRef in group.DstFiles)
+                                {
+                                    Interlocked.Increment(ref installProgress.StateCount);
+                                    Interlocked.Increment(ref installProgress.DownloadedCount);
+                                }
+                                ReportProgress();
+                                completedGroups++;
+                                continue;
+                            }
+
+                            await DownloadGroupDestinationsFromCdnAsync(
+                                groupIdx,
+                                group,
+                                $"{badSrcFiles.Count} source file(s) missing or wrong size — downloading destination files directly as full replacement.");
                             foreach (var m in badSrcFiles)
                                 SharedStatic.InstanceLogger.LogDebug(
                                     "[Patch::RunAsync]   Bad source: {File}", m);
-
-                            // Download each destination file from CDN
-                            foreach (var dstRef in group.DstFiles)
-                            {
-                                token.ThrowIfCancellationRequested();
-                                if (string.IsNullOrEmpty(dstRef.Dest)) continue;
-
-                                string dstRelative = dstRef.Dest.Replace('/', Path.DirectorySeparatorChar);
-                                string finalDst = Path.Combine(installPath, dstRelative);
-
-                                // If destination already matches target, skip download
-                                if (File.Exists(finalDst))
-                                {
-                                    var existFi = new FileInfo(finalDst);
-                                    if (existFi.Length == (long)dstRef.Size &&
-                                        !string.IsNullOrEmpty(dstRef.Md5))
-                                    {
-                                        await using var existStream = File.OpenRead(finalDst);
-                                        string existMd5 = await WuwaUtils
-                                            .ComputeMd5HexAsync(existStream, token)
-                                            .ConfigureAwait(false);
-                                        if (string.Equals(existMd5, dstRef.Md5,
-                                                StringComparison.OrdinalIgnoreCase))
-                                        {
-                                            SharedStatic.InstanceLogger.LogDebug(
-                                                "[Patch::RunAsync] Dest already at target, skip download: {Dst}",
-                                                dstRef.Dest);
-                                            Interlocked.Increment(ref installProgress.StateCount);
-                                            Interlocked.Add(ref installProgress.DownloadedBytes, (long)dstRef.Size);
-                                            Interlocked.Increment(ref installProgress.DownloadedCount);
-                                            ReportProgress();
-                                            continue;
-                                        }
-                                    }
-                                }
-
-                                string fileUrl = $"{fallbackBaseUrl}/{dstRef.Dest}";
-                                Uri uri = new(fileUrl, UriKind.Absolute);
-
-                                // Ensure directory exists
-                                string? dstDir = Path.GetDirectoryName(finalDst);
-                                if (!string.IsNullOrEmpty(dstDir))
-                                    Directory.CreateDirectory(dstDir);
-
-                                SharedStatic.InstanceLogger.LogDebug(
-                                    "[Patch::RunAsync] Downloading replacement: {Url}", fileUrl);
-
-                                long replacementAccum = 0;
-                                long replacementTotal = (long)dstRef.Size;
-
-                                await _owner.TryDownloadWholeFileWithFallbacksAsync(
-                                    uri, finalDst, dstRef.Dest, token,
-                                    bytes =>
-                                    {
-                                        Interlocked.Add(ref installProgress.DownloadedBytes, bytes);
-                                        long currentBytes = Interlocked.Add(ref replacementAccum, bytes);
-                                        SharedStaticV1Ext.InvokePerFileProgress(currentBytes, replacementTotal);
-                                        ReportProgress();
-                                    }).ConfigureAwait(false);
-
-                                // Post-download MD5 verification
-                                if (!string.IsNullOrEmpty(dstRef.Md5))
-                                {
-                                    await using var dlStream = File.OpenRead(finalDst);
-                                    string dlMd5 = await WuwaUtils
-                                        .ComputeMd5HexAsync(dlStream, token)
-                                        .ConfigureAwait(false);
-                                    if (!string.Equals(dlMd5, dstRef.Md5,
-                                            StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        throw new InvalidOperationException(
-                                            $"Downloaded replacement file MD5 mismatch for " +
-                                            $"{dstRef.Dest}: expected={dstRef.Md5}, computed={dlMd5}");
-                                    }
-                                }
-
-                                Interlocked.Increment(ref installProgress.StateCount);
-                                Interlocked.Increment(ref installProgress.DownloadedCount);
-                                ReportProgress();
-                            }
 
                             cumulativeExpectedBytes += groupExpectedBytes;
                             Interlocked.Exchange(ref installProgress.DownloadedBytes, cumulativeExpectedBytes);
@@ -1599,95 +1784,11 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                             if (!allDstMatchFallback)
                             {
-                                // Destination files don't match target yet — download each
-                                // one individually from CDN instead of throwing.  This
-                                // handles the case where a previous interrupted patch left
-                                // source files at mixed versions, making the krpdiff
-                                // produce garbage or crash (e.g. integer overflow).
-                                SharedStatic.InstanceLogger.LogWarning(
-                                    "[Patch::RunAsync] Group {Idx}: patch failed and destinations don't match. " +
-                                    "Downloading {Count} destination file(s) from CDN as fallback.",
-                                    groupIdx, group.DstFiles.Length);
-
-                                // Reset StateCount to pre-patch value before downloading
-                                Interlocked.Exchange(ref installProgress.StateCount, stateCountBeforePatch);
-
-                                foreach (var dstFallback in group.DstFiles)
-                                {
-                                    token.ThrowIfCancellationRequested();
-                                    if (string.IsNullOrEmpty(dstFallback.Dest)) continue;
-
-                                    string dstRelative = dstFallback.Dest.Replace('/', Path.DirectorySeparatorChar);
-                                    string finalDst = Path.Combine(installPath, dstRelative);
-
-                                    // Skip if this file already matches target
-                                    if (File.Exists(finalDst) && !string.IsNullOrEmpty(dstFallback.Md5))
-                                    {
-                                        var existFi = new FileInfo(finalDst);
-                                        if (existFi.Length == (long)dstFallback.Size)
-                                        {
-                                            await using var existStream = File.OpenRead(finalDst);
-                                            string existMd5 = await WuwaUtils
-                                                .ComputeMd5HexAsync(existStream, token)
-                                                .ConfigureAwait(false);
-                                            if (string.Equals(existMd5, dstFallback.Md5,
-                                                    StringComparison.OrdinalIgnoreCase))
-                                            {
-                                                SharedStatic.InstanceLogger.LogDebug(
-                                                    "[Patch::RunAsync] CDN fallback: file already at target, skip: {Dst}",
-                                                    dstFallback.Dest);
-                                                Interlocked.Increment(ref installProgress.StateCount);
-                                                Interlocked.Add(ref installProgress.DownloadedBytes, (long)dstFallback.Size);
-                                                Interlocked.Increment(ref installProgress.DownloadedCount);
-                                                ReportProgress();
-                                                continue;
-                                            }
-                                        }
-                                    }
-
-                                    string fileUrl = $"{fallbackBaseUrl}/{dstFallback.Dest}";
-                                    Uri uri = new(fileUrl, UriKind.Absolute);
-
-                                    string? dstDir = Path.GetDirectoryName(finalDst);
-                                    if (!string.IsNullOrEmpty(dstDir))
-                                        Directory.CreateDirectory(dstDir);
-
-                                    SharedStatic.InstanceLogger.LogDebug(
-                                        "[Patch::RunAsync] CDN fallback download: {Url}", fileUrl);
-
-                                    long replacementAccum = 0;
-                                    long replacementTotal = (long)dstFallback.Size;
-
-                                    await _owner.TryDownloadWholeFileWithFallbacksAsync(
-                                        uri, finalDst, dstFallback.Dest, token,
-                                        bytes =>
-                                        {
-                                            Interlocked.Add(ref installProgress.DownloadedBytes, bytes);
-                                            long currentBytes = Interlocked.Add(ref replacementAccum, bytes);
-                                            SharedStaticV1Ext.InvokePerFileProgress(currentBytes, replacementTotal);
-                                            ReportProgress();
-                                        }).ConfigureAwait(false);
-
-                                    // Verify downloaded file
-                                    if (!string.IsNullOrEmpty(dstFallback.Md5))
-                                    {
-                                        await using var dlStream = File.OpenRead(finalDst);
-                                        string dlMd5 = await WuwaUtils
-                                            .ComputeMd5HexAsync(dlStream, token)
-                                            .ConfigureAwait(false);
-                                        if (!string.Equals(dlMd5, dstFallback.Md5,
-                                                StringComparison.OrdinalIgnoreCase))
-                                        {
-                                            throw new InvalidOperationException(
-                                                $"CDN fallback file MD5 mismatch for " +
-                                                $"{dstFallback.Dest}: expected={dstFallback.Md5}, computed={dlMd5}");
-                                        }
-                                    }
-
-                                    Interlocked.Increment(ref installProgress.StateCount);
-                                    Interlocked.Increment(ref installProgress.DownloadedCount);
-                                    ReportProgress();
-                                }
+                                await DownloadGroupDestinationsFromCdnAsync(
+                                    groupIdx,
+                                    group,
+                                    $"patch failed and destinations don't match — downloading {group.DstFiles.Length} file(s) from CDN as fallback.",
+                                    restoreStateCountBefore: stateCountBeforePatch);
                             }
                             else
                             {
@@ -1811,43 +1912,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                                 if (!installedFileOk)
                                 {
-                                    // Neither patch output nor existing file matches — download from CDN
-                                    string fileUrl = $"{fallbackBaseUrl}/{dstRef.Dest}";
-                                    Uri uri = new(fileUrl, UriKind.Absolute);
-
-                                    string? dstDir = Path.GetDirectoryName(finalDst);
-                                    if (!string.IsNullOrEmpty(dstDir))
-                                        Directory.CreateDirectory(dstDir);
-
-                                    SharedStatic.InstanceLogger.LogWarning(
-                                        "[Patch::RunAsync] Downloading replacement from CDN: {Url}", fileUrl);
-
-                                    long replacementAccum = 0;
-                                    long replacementTotal = (long)dstRef.Size;
-
-                                    await _owner.TryDownloadWholeFileWithFallbacksAsync(
-                                        uri, finalDst, dstRef.Dest, token,
-                                        bytes =>
-                                        {
-                                            long currentBytes = Interlocked.Add(ref replacementAccum, bytes);
-                                            SharedStaticV1Ext.InvokePerFileProgress(currentBytes, replacementTotal);
-                                        }).ConfigureAwait(false);
-
-                                    // Verify the downloaded file
-                                    if (!string.IsNullOrEmpty(dstRef.Md5))
-                                    {
-                                        await using var dlStream = File.OpenRead(finalDst);
-                                        string dlMd5 = await WuwaUtils
-                                            .ComputeMd5HexAsync(dlStream, token)
-                                            .ConfigureAwait(false);
-                                        if (!string.Equals(dlMd5, dstRef.Md5,
-                                                StringComparison.OrdinalIgnoreCase))
-                                        {
-                                            throw new InvalidOperationException(
-                                                $"CDN replacement file MD5 mismatch for " +
-                                                $"{dstRef.Dest}: expected={dstRef.Md5}, computed={dlMd5}");
-                                        }
-                                    }
+                                    await DownloadReplacementFromCdnAsync(dstRef, updateGlobalProgress: false)
+                                        .ConfigureAwait(false);
                                 }
 
                                 // File is already correct in install dir (either already
