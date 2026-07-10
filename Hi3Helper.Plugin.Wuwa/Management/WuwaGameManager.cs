@@ -390,6 +390,19 @@ internal partial class WuwaGameManager : GameManagerBase
         // (e.g. game updated via the official Kuro launcher), sync local version only.
         await TrySyncVersionFromExternalUpdateAsync(token).ConfigureAwait(false);
 
+        // Cache CDN manifest URLs for the installed version while they are known.
+        if (CurrentGameVersion == ApiGameVersion)
+        {
+            string? previousIndexUrl = CurrentGameConfigNode["resourceIndexUrl"]?.GetValue<string>();
+            PersistInstalledVersionResourceUrls();
+            string? currentIndexUrl = CurrentGameConfigNode["resourceIndexUrl"]?.GetValue<string>();
+            if (!string.IsNullOrEmpty(currentIndexUrl)
+                && !string.Equals(previousIndexUrl, currentIndexUrl, StringComparison.Ordinal))
+            {
+                SaveConfig();
+            }
+        }
+
         return 0;
     }
 
@@ -779,6 +792,8 @@ internal partial class WuwaGameManager : GameManagerBase
             CurrentGameVersion = ApiGameVersion;
         }
 
+        PersistInstalledVersionResourceUrls();
+
         // Persist to disk (write app-game-config.json)
         try
         {
@@ -1005,4 +1020,149 @@ internal partial class WuwaGameManager : GameManagerBase
 
     internal WuwaApiResponseGameConfigRef? ApiPredownloadReference
         => ApiGameConfigResponse?.PredownloadReference?.ConfigReference;
+
+    internal readonly record struct VersionResourceUrls(string IndexUrl, string BaseUrl);
+
+    /// <summary>
+    /// Resolves the CDN index and download-base URLs for the currently installed game version.
+    /// Uses live API paths when versions match, otherwise reads persisted URLs from app-game-config.
+    /// </summary>
+    internal bool TryGetInstalledVersionResourceUrls(out VersionResourceUrls urls)
+    {
+        if (CurrentGameVersion != GameVersion.Empty
+            && CurrentGameVersion == ApiGameVersion
+            && !string.IsNullOrEmpty(GameResourceBaseUrl)
+            && !string.IsNullOrEmpty(GameResourceBasisPath))
+        {
+            urls = new VersionResourceUrls(GameResourceBaseUrl, GameResourceBasisPath);
+            return true;
+        }
+
+        if (CurrentGameConfigNode.TryGetPropertyValue("resourceIndexUrl", out JsonNode? indexNode)
+            && CurrentGameConfigNode.TryGetPropertyValue("resourceBaseUrl", out JsonNode? baseNode))
+        {
+            string? indexUrl = indexNode?.GetValue<string>();
+            string? baseUrl = baseNode?.GetValue<string>();
+            if (!string.IsNullOrEmpty(indexUrl) && !string.IsNullOrEmpty(baseUrl))
+            {
+                urls = new VersionResourceUrls(indexUrl, baseUrl);
+                return true;
+            }
+        }
+
+        urls = default;
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves CDN URLs for the installed version, probing candidate paths derived from
+    /// the live API when persisted URLs are unavailable. Persists successful matches.
+    /// </summary>
+    internal async Task<(bool Found, VersionResourceUrls Urls)> TryResolveInstalledVersionResourceUrlsAsync(
+        WuwaApiResponseGameConfigRef? activePatchConfig,
+        WuwaGameInstaller installer,
+        CancellationToken token)
+    {
+        if (TryGetInstalledVersionResourceUrls(out VersionResourceUrls urls))
+            return (true, urls);
+
+        if (CurrentGameVersion == GameVersion.Empty)
+            return (false, default);
+
+        string host = ApiResponseAssetUrl.TrimEnd('/');
+        WuwaApiResponseResourceIndex? resolvedIndex = null;
+        string? resolvedIndexUrl = null;
+        string? resolvedBaseUrl = null;
+
+        foreach (var candidate in WuwaVersionResourceUrlResolver.BuildProbeCandidates(
+                     CurrentGameVersion, ApiGameConfigResponse, activePatchConfig))
+        {
+            token.ThrowIfCancellationRequested();
+
+            string indexUrl = $"{host}/{candidate.IndexPath.TrimStart('/')}";
+            WuwaApiResponseResourceIndex? index =
+                await installer.FetchResourceIndexAsync(indexUrl, token).ConfigureAwait(false);
+            if (index?.Resource is not { Length: > 0 })
+                continue;
+
+            string? basePath = WuwaVersionResourceUrlResolver.ResolveDownloadBasePath(index, candidate.ZipBasePaths);
+            if (string.IsNullOrEmpty(basePath))
+                continue;
+
+            resolvedIndex = index;
+            resolvedIndexUrl = indexUrl;
+            resolvedBaseUrl = basePath;
+            break;
+        }
+
+        if (resolvedIndexUrl == null || resolvedBaseUrl == null)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameManager::TryResolveInstalledVersionResourceUrlsAsync] " +
+                "Could not probe a CDN manifest for installed version {Version}. " +
+                "Source-file repair requires resourceIndexUrl/resourceBaseUrl persisted while the API still matched that version.",
+                CurrentGameVersion);
+            return (false, default);
+        }
+
+        urls = new VersionResourceUrls(resolvedIndexUrl, resolvedBaseUrl);
+        CurrentGameConfigNode["resourceIndexUrl"] = resolvedIndexUrl;
+        CurrentGameConfigNode["resourceBaseUrl"] = resolvedBaseUrl;
+
+        try
+        {
+            SaveConfig();
+        }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameManager::TryResolveInstalledVersionResourceUrlsAsync] Resolved URLs but failed to persist: {Err}",
+                ex.Message);
+        }
+
+        SharedStatic.InstanceLogger.LogInformation(
+            "[WuwaGameManager::TryResolveInstalledVersionResourceUrlsAsync] Resolved source URLs for {Version}: index={Index}, base={Base} ({Count} manifest entries)",
+            CurrentGameVersion, resolvedIndexUrl, resolvedBaseUrl, resolvedIndex!.Resource.Length);
+
+        return (true, urls);
+    }
+
+    /// <summary>
+    /// Stores CDN manifest URLs in app-game-config for the installed version so they remain
+    /// available after the live API moves to a newer version.
+    /// </summary>
+    internal void PersistInstalledVersionResourceUrls()
+    {
+        if (CurrentGameVersion == GameVersion.Empty || CurrentGameVersion != ApiGameVersion)
+            return;
+        if (string.IsNullOrEmpty(GameResourceBaseUrl) || string.IsNullOrEmpty(GameResourceBasisPath))
+            return;
+
+        CurrentGameConfigNode["resourceIndexUrl"] = GameResourceBaseUrl;
+        CurrentGameConfigNode["resourceBaseUrl"] = GameResourceBasisPath;
+    }
+
+    /// <summary>
+    /// Loads the on-disk LocalGameResources.json manifest as a fallback when the CDN index
+    /// for the installed version is unavailable.
+    /// </summary>
+    internal static WuwaApiResponseResourceIndex? TryLoadLocalGameResourcesIndex(string installPath)
+    {
+        string path = Path.Combine(installPath, "LocalGameResources.json");
+        if (!File.Exists(path))
+            return null;
+
+        try
+        {
+            using FileStream fs = File.OpenRead(path);
+            return JsonSerializer.Deserialize(fs, WuwaApiResponseContext.Default.WuwaApiResponseResourceIndex);
+        }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameManager::TryLoadLocalGameResourcesIndex] Failed to read {Path}: {Err}",
+                path, ex.Message);
+            return null;
+        }
+    }
 }

@@ -58,4 +58,7 @@ public class WuwaApiResponsePatchFileRef
     [JsonPropertyName("size")]
     [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
     public ulong Size { get; set; }
+
+    [JsonPropertyName("chunkInfos")]
+    public WuwaApiResponseResourceChunkInfo[]? ChunkInfos { get; set; }
 }

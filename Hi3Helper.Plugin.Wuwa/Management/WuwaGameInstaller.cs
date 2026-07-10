@@ -425,6 +425,9 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 		_cacheExpiredUntil = DateTimeOffset.UtcNow.AddMinutes(ExCacheDurationInMinute);
 	}
 
+    internal Task<WuwaApiResponseResourceIndex?> FetchResourceIndexAsync(string indexUrl, CancellationToken token)
+        => DownloadResourceIndexAsync(indexUrl, token);
+
 	private async Task<WuwaApiResponseResourceIndex?> DownloadResourceIndexAsync(string url, CancellationToken token)
 	{
 		SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::DownloadResourceIndexAsync] Requesting index URL: {Url}", url);
@@ -470,6 +473,10 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 
 				if (TryGetPropertyCI(item, "md5", out JsonElement md5El) && md5El.ValueKind == JsonValueKind.String)
 					entry.Md5 = md5El.GetString();
+
+				if (TryGetPropertyCI(item, "fromFolder", out JsonElement fromFolderEl)
+				    && fromFolderEl.ValueKind == JsonValueKind.String)
+					entry.FromFolder = fromFolderEl.GetString();
 
 				// size may be number or string
 				if (TryGetPropertyCI(item, "size", out JsonElement sizeEl))

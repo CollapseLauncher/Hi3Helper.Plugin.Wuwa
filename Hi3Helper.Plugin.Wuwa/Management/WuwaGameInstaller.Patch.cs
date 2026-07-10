@@ -555,6 +555,20 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 };
                 var currentProgressState = InstallProgressState.Idle;
 
+                void ApplyProgressState(InstallProgressState state)
+                {
+                    currentProgressState = state;
+                    try
+                    {
+                        progressStateDelegate?.Invoke(currentProgressState);
+                    }
+                    catch (Exception ex)
+                    {
+                        SharedStatic.InstanceLogger.LogWarning(
+                            "[Patch::ApplyProgressState] Failed to invoke state delegate: {Err}", ex.Message);
+                    }
+                }
+
                 int lastLoggedDownloadedCount = -1;
 
                 void ReportProgress()
@@ -570,6 +584,11 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         snap.DownloadedBytes      = Interlocked.Read(ref installProgress.DownloadedBytes);
                         snap.TotalBytesToDownload = Interlocked.Read(ref installProgress.TotalBytesToDownload);
 
+                        if (snap.TotalStateToComplete <= 0 && snap.TotalCountToDownload > 0)
+                            snap.TotalStateToComplete = snap.TotalCountToDownload;
+                        if (snap.TotalCountToDownload <= 0 && snap.TotalStateToComplete > 0)
+                            snap.TotalCountToDownload = snap.TotalStateToComplete;
+
                         int prev = Interlocked.Exchange(ref lastLoggedDownloadedCount, snap.DownloadedCount);
                         if (prev != snap.DownloadedCount)
                         {
@@ -583,18 +602,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         }
 
                         progressDelegate?.Invoke(in snap);
-                        progressStateDelegate?.Invoke(currentProgressState);
-
-                        // The host-side adapter (PluginGameInstallWrapper) applies a
-                        // 100 ms refresh-window check with *inverted* logic: the first
-                        // call after a >100 ms gap resets the internal timer and is
-                        // silently discarded.  A second, immediate invocation always
-                        // falls inside the window and actually triggers the UI progress
-                        // update (ProgressChanged event).  During the download phase the
-                        // HTTP callbacks fire fast enough that some naturally slip
-                        // through, but during the install/apply phase callbacks are
-                        // spaced far apart and ALL get swallowed without this workaround.
-                        progressDelegate?.Invoke(in snap);
                     }
                     catch (Exception ex)
                     {
@@ -604,7 +611,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 }
 
                 // ── Step 1: Resolve the correct patch config ──
-                currentProgressState = InstallProgressState.Preparing;
+                ApplyProgressState(InstallProgressState.Preparing);
                 ReportProgress();
 
                 manager.GetCurrentGameVersion(out GameVersion currentVersion);
@@ -673,8 +680,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 }
                 else if (!onlyDownload && patchIndex.GroupInfos.Length > 0)
                 {
-                    currentProgressState = InstallProgressState.Verify;
-
                     // ── Load previous pre-flight state (resume support) ──
                     // File format: line 1 = patchIndexUrl (staleness key),
                     //              subsequent lines = "M\t<dest>" (match) or "X\t<dest>" (mismatch).
@@ -751,6 +756,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     installProgress.StateCount = 0;
                     installProgress.TotalBytesToDownload = totalPreflightBytes;
                     installProgress.DownloadedBytes = 0;
+                    ApplyProgressState(InstallProgressState.Verify);
                     ReportProgress();
 
                     SharedStatic.InstanceLogger.LogInformation(
@@ -817,7 +823,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             if (dstRef.Size > 0 && (ulong)fi.Length != dstRef.Size)
                             {
                                 SharedStatic.InstanceLogger.LogDebug(
-                                    "[Patch::RunAsync] Pre-flight: size mismatch for {File} (expected={Expected}, actual={Actual}), will patch.",
+                                    "[Patch::RunAsync] Pre-flight: {File} not at target version (size expected={Expected}, actual={Actual}), will patch.",
                                     dstRef.Dest, dstRef.Size, fi.Length);
                                 mismatchedDstFiles.Add(dstRef.Dest);
                                 await preflightStateWriter.WriteLineAsync($"X\t{dstRef.Dest}").ConfigureAwait(false);
@@ -855,7 +861,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                 if (!string.Equals(md5, dstRef.Md5, StringComparison.OrdinalIgnoreCase))
                                 {
                                     SharedStatic.InstanceLogger.LogDebug(
-                                        "[Patch::RunAsync] Pre-flight: MD5 mismatch for {File}, will patch.",
+                                        "[Patch::RunAsync] Pre-flight: {File} not at target version (MD5 mismatch), will patch.",
                                         dstRef.Dest);
                                     mismatchedDstFiles.Add(dstRef.Dest);
                                     await preflightStateWriter.WriteLineAsync($"X\t{dstRef.Dest}").ConfigureAwait(false);
@@ -910,7 +916,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         }
                         catch { /* best-effort */ }
 
-                        currentProgressState = InstallProgressState.Completed;
+                        ApplyProgressState(InstallProgressState.Completed);
                         ReportProgress();
                         return;
                     }
@@ -1091,9 +1097,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                 if (downloadEntries.Length > 0)
                 {
-                    currentProgressState = InstallProgressState.Download;
-
-                    // Calculate total bytes and set progress
+                    // Calculate total bytes and set progress before switching UI state
                     ulong totalBytes = 0;
                     foreach (var e in downloadEntries)
                         totalBytes += e.Size;
@@ -1104,6 +1108,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     installProgress.DownloadedCount = 0;
                     installProgress.StateCount = 0;
                     installProgress.TotalStateToComplete = downloadEntries.Length;
+
+                    ApplyProgressState(InstallProgressState.Download);
                     ReportProgress();
 
                     // Build the absolute base download URLs:
@@ -1249,8 +1255,14 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 }
 
                 // ── Step 6: Verify downloaded files ──
-                currentProgressState = InstallProgressState.Verify;
+                installProgress.TotalStateToComplete = downloadEntries.Length;
+                installProgress.TotalCountToDownload = downloadEntries.Length;
+                installProgress.StateCount = 0;
+                installProgress.DownloadedCount = 0;
+                ApplyProgressState(InstallProgressState.Verify);
                 ReportProgress();
+
+                int verifiedDownloadCount = 0;
                 foreach (var entry in downloadEntries)
                 {
                     token.ThrowIfCancellationRequested();
@@ -1288,6 +1300,10 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                 SharedStatic.InstanceLogger.LogDebug(
                                     "[Patch::RunAsync] Verification: full-replacement file verified in install dir (skipped download): {Dest}",
                                     entry.Dest);
+                                verifiedDownloadCount++;
+                                installProgress.StateCount = verifiedDownloadCount;
+                                installProgress.DownloadedCount = verifiedDownloadCount;
+                                ReportProgress();
                                 continue;
                             }
                         }
@@ -1318,6 +1334,11 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                 $"MD5 mismatch for downloaded file {entry.Dest}: expected={entry.Md5}, computed={computedMd5}");
                         }
                     }
+
+                    verifiedDownloadCount++;
+                    installProgress.StateCount = verifiedDownloadCount;
+                    installProgress.DownloadedCount = verifiedDownloadCount;
+                    ReportProgress();
                 }
 
                 // ── Step 7: If preload only, stop here ──
@@ -1331,12 +1352,65 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     string markerPath = Path.Combine(patchTempPath, ".version");
                     await File.WriteAllTextAsync(markerPath, targetVersion.ToString(), token).ConfigureAwait(false);
 
-                    currentProgressState = InstallProgressState.Completed;
+                    ApplyProgressState(InstallProgressState.Completed);
                     ReportProgress();
                     SharedStatic.InstanceLogger.LogInformation(
                         "[Patch::RunAsync] Preload download complete. Files saved to {Path}. Target version: {Version}",
                         patchTempPath, targetVersion);
                     return;
+                }
+
+                // ── Step 7b: Reconcile installed source files against CDN manifest ──
+                if (patchIndex.GroupInfos.Length > 0 && !manager.DEBUG_SkipPreflight)
+                {
+                    void SetReconciliationProgressState(InstallProgressState state)
+                    {
+                        ApplyProgressState(state);
+                        ReportProgress();
+                    }
+
+                    void InitializeReconcileProgress(int totalFiles, long totalBytes)
+                    {
+                        installProgress.TotalBytesToDownload = totalBytes;
+                        installProgress.DownloadedBytes      = 0;
+                        installProgress.TotalCountToDownload = totalFiles;
+                        installProgress.DownloadedCount      = 0;
+                        installProgress.TotalStateToComplete = totalFiles;
+                        installProgress.StateCount           = 0;
+                    }
+
+                    void SetReconcileFileProgress(int fileIndex)
+                    {
+                        Volatile.Write(ref installProgress.StateCount, fileIndex);
+                        Volatile.Write(ref installProgress.DownloadedCount, fileIndex);
+                    }
+
+                    void AddReconcileBytes(long bytes) =>
+                        Interlocked.Add(ref installProgress.DownloadedBytes, bytes);
+
+                    void AddReconcileTotalBytes(long bytes) =>
+                        Interlocked.Add(ref installProgress.TotalBytesToDownload, bytes);
+
+                    void CompleteReconcileProgress(int totalFiles)
+                    {
+                        installProgress.StateCount    = totalFiles;
+                        installProgress.DownloadedCount = totalFiles;
+                        installProgress.DownloadedBytes = Interlocked.Read(ref installProgress.TotalBytesToDownload);
+                    }
+
+                    await ReconcileSourceFilesBeforeApplyAsync(
+                        manager,
+                        patchConfig,
+                        installPath,
+                        patchIndex,
+                        InitializeReconcileProgress,
+                        SetReconcileFileProgress,
+                        AddReconcileBytes,
+                        AddReconcileTotalBytes,
+                        CompleteReconcileProgress,
+                        SetReconciliationProgressState,
+                        ReportProgress,
+                        token).ConfigureAwait(false);
                 }
 
                 // ── Step 8: Apply patches from groupInfos ──
@@ -1374,6 +1448,12 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     ? fallbackRelativeBase
                     : $"{fallbackCdnHost}/{fallbackRelativeBase.TrimStart('/')}";
 
+                string krpdiffRelativeBase = (patchConfig.BaseUrl ?? _owner.GameResourceBasisPath ?? "").TrimEnd('/');
+                string krpdiffCdnHost = (_owner.ApiResponseAssetUrl ?? "").TrimEnd('/');
+                string krpdiffPatchBaseUrl = string.IsNullOrEmpty(krpdiffCdnHost)
+                    ? krpdiffRelativeBase
+                    : $"{krpdiffCdnHost}/{krpdiffRelativeBase.TrimStart('/')}";
+
                 var resourceDestLookup = new Dictionary<string, WuwaApiResponseResourceEntry>(
                     StringComparer.OrdinalIgnoreCase);
                 foreach (var entry in patchIndex.Resource)
@@ -1400,6 +1480,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     string expectedMd5 = resourceEntry?.Md5 ?? dstRef.Md5 ?? "";
                     ulong expectedSize = resourceEntry is { Size: > 0 } ? resourceEntry.Size : dstRef.Size;
                     WuwaApiResponseResourceChunkInfo[]? chunkInfos = resourceEntry?.ChunkInfos;
+                    if (chunkInfos is not { Length: > 0 })
+                        chunkInfos = dstRef.ChunkInfos;
 
                     if (!string.IsNullOrEmpty(resourceEntry?.Md5) && !string.IsNullOrEmpty(dstRef.Md5)
                         && !string.Equals(resourceEntry.Md5, dstRef.Md5, StringComparison.OrdinalIgnoreCase))
@@ -1520,7 +1602,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                 if (patchIndex.GroupInfos.Length > 0)
                 {
-                    currentProgressState = InstallProgressState.Updating;
+                    ApplyProgressState(InstallProgressState.Updating);
 
                     // Count total destination files and bytes across all groups.
                     // Fall back to group count when DstFiles are empty (e.g. API parsing
@@ -1548,6 +1630,14 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                     int completedGroups = 0;
                     long cumulativeExpectedBytes = 0; // exact byte total after each completed group
+
+                    // Track consecutive patch failures to detect systemic source mismatch.
+                    // If multiple groups fail post-patch verification in a row, the user's
+                    // installation is likely from a different build — skip remaining patches
+                    // and download directly from CDN to avoid wasting time.
+                    const int patchFailureThreshold = 2;
+                    int consecutivePatchFailures = 0;
+                    bool forceDirectDownload = false;
 
                     for (int groupIdx = 0; groupIdx < patchIndex.GroupInfos.Length; groupIdx++)
                     {
@@ -1596,6 +1686,20 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             continue;
                         }
 
+                        // ─ Force-download bypass: if prior groups showed systemic source mismatch ─
+                        if (forceDirectDownload)
+                        {
+                            await DownloadGroupDestinationsFromCdnAsync(
+                                groupIdx,
+                                group,
+                                $"skipping patch (prior groups failed source validation) — downloading from CDN.");
+                            cumulativeExpectedBytes += groupExpectedBytes;
+                            Interlocked.Exchange(ref installProgress.DownloadedBytes, cumulativeExpectedBytes);
+                            ReportProgress();
+                            completedGroups++;
+                            continue;
+                        }
+
                         // ─ Find the krpdiff for this group ─
                         string krpdiffPath = FindKrpdiffFile(
                             patchTempPath,
@@ -1603,30 +1707,78 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             krpdiffEntries,
                             groupIdx);
 
-                        // ─ Pre-check: verify all source files exist and match expected sizes ─
+                        WuwaApiResponseResourceEntry? krpdiffEntry = FindKrpdiffEntry(krpdiffEntries, groupIdx);
+                        if (krpdiffEntry != null)
+                        {
+                            string? krpdiffIssue = await WuwaPatchPreflight.ValidateLocalFileAsync(
+                                krpdiffPath, krpdiffEntry.Size, krpdiffEntry.Md5 ?? "", token)
+                                .ConfigureAwait(false);
+                            if (krpdiffIssue != null)
+                            {
+                                SharedStatic.InstanceLogger.LogWarning(
+                                    "[Patch::RunAsync] Group {Idx}: krpdiff failed validation ({Reason}). Re-downloading.",
+                                    groupIdx, krpdiffIssue);
+
+                                try
+                                {
+                                    string encodedKrpdiff = EncodePathSegments(krpdiffEntry.Dest ?? "");
+                                    string krpdiffUrl = $"{krpdiffPatchBaseUrl}/{encodedKrpdiff}";
+                                    Uri krpdiffUri = new(krpdiffUrl, UriKind.Absolute);
+
+                                    if (krpdiffEntry.ChunkInfos is { Length: > 0 })
+                                    {
+                                        await _owner.TryDownloadChunkedFileWithFallbacksAsync(
+                                            krpdiffUri, krpdiffPath, krpdiffEntry.ChunkInfos,
+                                            krpdiffEntry.Dest ?? "", token, null).ConfigureAwait(false);
+                                    }
+                                    else
+                                    {
+                                        await _owner.TryDownloadWholeFileWithFallbacksAsync(
+                                            krpdiffUri, krpdiffPath, krpdiffEntry.Dest ?? "", token, null)
+                                            .ConfigureAwait(false);
+                                    }
+
+                                    krpdiffIssue = await WuwaPatchPreflight.ValidateLocalFileAsync(
+                                        krpdiffPath, krpdiffEntry.Size, krpdiffEntry.Md5 ?? "", token)
+                                        .ConfigureAwait(false);
+                                }
+                                catch (Exception dlEx) when (dlEx is not OperationCanceledException)
+                                {
+                                    SharedStatic.InstanceLogger.LogWarning(
+                                        "[Patch::RunAsync] Group {Idx}: krpdiff re-download failed: {Err}",
+                                        groupIdx, dlEx.Message);
+                                    krpdiffIssue ??= "re-download failed";
+                                }
+
+                                if (krpdiffIssue != null)
+                                {
+                                    SharedStatic.InstanceLogger.LogWarning(
+                                        "[Patch::RunAsync] Group {Idx}: krpdiff still invalid ({Reason}) — " +
+                                        "downloading destination files from CDN instead.",
+                                        groupIdx, krpdiffIssue);
+                                    await DownloadGroupDestinationsFromCdnAsync(
+                                        groupIdx,
+                                        group,
+                                        $"krpdiff invalid ({krpdiffIssue}) — downloading destination files directly.");
+                                    cumulativeExpectedBytes += groupExpectedBytes;
+                                    Interlocked.Exchange(ref installProgress.DownloadedBytes, cumulativeExpectedBytes);
+                                    ReportProgress();
+                                    completedGroups++;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // ─ Pre-check: verify all source files exist and match expected size/MD5 ─
                         // Directory-level krpdiffs need the old source files on disk at
-                        // their ORIGINAL version.  If any are missing OR have the wrong
-                        // size (e.g. overwritten with target version by a previous
+                        // their ORIGINAL version.  If any are missing, wrong size, or wrong
+                        // hash (e.g. overwritten with target version by a previous
                         // interrupted patch), the krpdiff will produce garbage output or
                         // crash.  Detect this upfront and download the target destination
                         // files directly from the CDN instead.
-                        var badSrcFiles = new List<string>();
-                        foreach (var srcRef in group.SrcFiles)
-                        {
-                            if (string.IsNullOrEmpty(srcRef.Dest)) continue;
-                            string srcPath = Path.Combine(installPath,
-                                srcRef.Dest.Replace('/', Path.DirectorySeparatorChar));
-                            if (!File.Exists(srcPath))
-                            {
-                                badSrcFiles.Add(srcRef.Dest);
-                            }
-                            else if (srcRef.Size > 0)
-                            {
-                                var srcFi = new FileInfo(srcPath);
-                                if ((ulong)srcFi.Length != srcRef.Size)
-                                    badSrcFiles.Add(srcRef.Dest);
-                            }
-                        }
+                        var badSrcFiles = await WuwaPatchPreflight
+                            .FindBadSourceFilesAsync(installPath, group, token)
+                            .ConfigureAwait(false);
 
                         if (badSrcFiles.Count > 0)
                         {
@@ -1635,12 +1787,12 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                     .ConfigureAwait(false))
                             {
                                 SharedStatic.InstanceLogger.LogInformation(
-                                    "[Patch::RunAsync] Group {Idx}: {BadCount} source file(s) missing or wrong size, " +
+                                    "[Patch::RunAsync] Group {Idx}: {BadCount} source file(s) missing or invalid, " +
                                     "but all destination files already match target — skipping group.",
                                     groupIdx, badSrcFiles.Count);
                                 foreach (var m in badSrcFiles)
                                     SharedStatic.InstanceLogger.LogDebug(
-                                        "[Patch::RunAsync]   Bad source: {File}", m);
+                                        "[Patch::RunAsync]   Bad source: {File} ({Reason})", m.Dest, m.Reason);
 
                                 cumulativeExpectedBytes += groupExpectedBytes;
                                 Interlocked.Exchange(ref installProgress.DownloadedBytes, cumulativeExpectedBytes);
@@ -1657,10 +1809,10 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             await DownloadGroupDestinationsFromCdnAsync(
                                 groupIdx,
                                 group,
-                                $"{badSrcFiles.Count} source file(s) missing or wrong size — downloading destination files directly as full replacement.");
+                                $"{badSrcFiles.Count} source file(s) missing or invalid — downloading destination files directly as full replacement.");
                             foreach (var m in badSrcFiles)
                                 SharedStatic.InstanceLogger.LogDebug(
-                                    "[Patch::RunAsync]   Bad source: {File}", m);
+                                    "[Patch::RunAsync]   Bad source: {File} ({Reason})", m.Dest, m.Reason);
 
                             cumulativeExpectedBytes += groupExpectedBytes;
                             Interlocked.Exchange(ref installProgress.DownloadedBytes, cumulativeExpectedBytes);
@@ -1689,56 +1841,200 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                         // Track StateCount before patching for exception recovery
                         int stateCountBeforePatch = Volatile.Read(ref installProgress.StateCount);
-                        
+
+                        // ─ Pre-check: validate combined source size matches krpdiff expectation ─
+                        // The krpdiff header stores the expected combined size of all referenced
+                        // source files. If our source files have different total size, the patch
+                        // is guaranteed to fail. Detect this early to avoid wasted I/O.
+                        long krpdiffExpectedOldSize = HPatchZNative.GetExpectedOldSize(krpdiffPath);
+                        if (krpdiffExpectedOldSize > 0 && group.SrcFiles.Length > 0)
+                        {
+                            long actualSrcTotalSize = 0;
+                            foreach (var srcRef in group.SrcFiles)
+                            {
+                                if (string.IsNullOrEmpty(srcRef.Dest))
+                                    continue;
+                                string srcPath = Path.Combine(installPath,
+                                    srcRef.Dest.Replace('/', Path.DirectorySeparatorChar));
+                                if (File.Exists(srcPath))
+                                    actualSrcTotalSize += new FileInfo(srcPath).Length;
+                            }
+
+                            if (actualSrcTotalSize > 0 && actualSrcTotalSize != krpdiffExpectedOldSize)
+                            {
+                                SharedStatic.InstanceLogger.LogWarning(
+                                    "[Patch::RunAsync] Group {Idx}: krpdiff expects source data size {Expected} bytes " +
+                                    "but actual source files total {Actual} bytes — patch will fail. " +
+                                    "Downloading from CDN.",
+                                    groupIdx, krpdiffExpectedOldSize, actualSrcTotalSize);
+                                await DownloadGroupDestinationsFromCdnAsync(
+                                    groupIdx,
+                                    group,
+                                    $"source size mismatch (krpdiff expects {krpdiffExpectedOldSize}, " +
+                                    $"actual {actualSrcTotalSize}) — downloading from CDN.");
+                                cumulativeExpectedBytes += groupExpectedBytes;
+                                Interlocked.Exchange(ref installProgress.DownloadedBytes, cumulativeExpectedBytes);
+                                ReportProgress();
+                                completedGroups++;
+                                continue;
+                            }
+                        }
+
+                        bool patchSucceeded = false;
+                        Exception? lastPatchError = null;
+                        string? isolatedSrcDir = null;
+
                         try
                         {
-                            // Use writeBytesDelegate for real-time byte progress during
-                            // the (blocking) patch operation so the UI stays responsive.
-                            // Also increment StateCount proportionally based on bytes written
-                            // to show file-level progress (prevents "Updating 0/91" display).
                             long patchBytesAccum = 0;
                             long totalBytesWritten = 0;
                             const long patchReportThreshold = 4 << 20; // ~4 MiB
-                            
-                            // Calculate bytes per file for proportional StateCount updates
                             long bytesPerFile = groupExpectedBytes > 0 && group.DstFiles.Length > 0
                                 ? groupExpectedBytes / group.DstFiles.Length
                                 : 1;
                             int lastReportedFileCount = 0;
 
-                            HPatchZNative.ApplyDirPatch(installPath, krpdiffPath, tempGroupDir,
-                                writeBytesDelegate: bytesWritten =>
-                                {
-                                    Interlocked.Add(ref installProgress.DownloadedBytes, bytesWritten);
-                                    totalBytesWritten += bytesWritten;
-                                    patchBytesAccum += bytesWritten;
-                                    
-                                    // Estimate completed files based on bytes written
-                                    int estimatedFiles = bytesPerFile > 0
-                                        ? Math.Min((int)(totalBytesWritten / bytesPerFile), group.DstFiles.Length)
-                                        : 0;
-                                    
-                                    // Update StateCount incrementally as we estimate file completion
-                                    if (estimatedFiles > lastReportedFileCount)
-                                    {
-                                        int filesToAdd = estimatedFiles - lastReportedFileCount;
-                                        Interlocked.Add(ref installProgress.StateCount, filesToAdd);
-                                        lastReportedFileCount = estimatedFiles;
-                                    }
-                                    
-                                    if (patchBytesAccum >= patchReportThreshold)
-                                    {
-                                        ReportProgress();
-                                        patchBytesAccum = 0;
-                                    }
-                                }, token: token);
+                            Action<long> patchProgressCallback = bytesWritten =>
+                            {
+                                Interlocked.Add(ref installProgress.DownloadedBytes, bytesWritten);
+                                totalBytesWritten += bytesWritten;
+                                patchBytesAccum += bytesWritten;
 
-                            // Final flush in case last chunk was below threshold
-                            if (patchBytesAccum > 0)
-                                ReportProgress();
+                                int estimatedFiles = bytesPerFile > 0
+                                    ? Math.Min((int)(totalBytesWritten / bytesPerFile), group.DstFiles.Length)
+                                    : 0;
+
+                                if (estimatedFiles > lastReportedFileCount)
+                                {
+                                    int filesToAdd = estimatedFiles - lastReportedFileCount;
+                                    Interlocked.Add(ref installProgress.StateCount, filesToAdd);
+                                    lastReportedFileCount = estimatedFiles;
+                                }
+
+                                if (patchBytesAccum >= patchReportThreshold)
+                                {
+                                    ReportProgress();
+                                    patchBytesAccum = 0;
+                                }
+                            };
+
+                            var sourceDirs = new List<string>();
+                            isolatedSrcDir = WuwaPatchSourceStaging.TryCreate(
+                                installPath, group, patchTempPath, groupIdx);
+                            if (isolatedSrcDir != null)
+                                sourceDirs.Add(isolatedSrcDir);
+                            else if (group.SrcFiles.Length > 0)
+                            {
+                                SharedStatic.InstanceLogger.LogDebug(
+                                    "[Patch::RunAsync] Group {Idx}: isolated source staging unavailable; " +
+                                    "patching against full install root only.",
+                                    groupIdx);
+                            }
+                            sourceDirs.Add(installPath);
+
+                            foreach (var srcRef in group.SrcFiles)
+                            {
+                                if (string.IsNullOrEmpty(srcRef.Dest))
+                                    continue;
+                                string srcPath = Path.Combine(installPath,
+                                    srcRef.Dest.Replace('/', Path.DirectorySeparatorChar));
+                                long actualSize = File.Exists(srcPath) ? new FileInfo(srcPath).Length : -1;
+                                SharedStatic.InstanceLogger.LogDebug(
+                                    "[Patch::RunAsync] Group {Idx} source check: {File} expectedSize={Expected} actualSize={Actual}",
+                                    groupIdx, srcRef.Dest, srcRef.Size, actualSize);
+                            }
+
+                            foreach (string sourceDir in sourceDirs)
+                            {
+                                token.ThrowIfCancellationRequested();
+
+                                if (Directory.Exists(tempGroupDir))
+                                {
+                                    try { Directory.Delete(tempGroupDir, true); }
+                                    catch { /* best-effort */ }
+                                }
+
+                                if (!string.Equals(sourceDir, installPath, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    SharedStatic.InstanceLogger.LogInformation(
+                                        "[Patch::RunAsync] Group {Idx}: applying dir patch with isolated source tree at {Src}",
+                                        groupIdx, sourceDir);
+                                }
+                                else if (isolatedSrcDir != null)
+                                {
+                                    SharedStatic.InstanceLogger.LogInformation(
+                                        "[Patch::RunAsync] Group {Idx}: isolated source patch failed; retrying with full install root",
+                                        groupIdx);
+                                }
+
+                                // Save progress state so we can revert on failure before retry.
+                                long bytesBeforeAttempt = Volatile.Read(ref installProgress.DownloadedBytes);
+                                int stateBeforeAttempt = Volatile.Read(ref installProgress.StateCount);
+
+                                try
+                                {
+                                    patchBytesAccum = 0;
+                                    HPatchZNative.ApplyDirPatch(sourceDir, krpdiffPath, tempGroupDir,
+                                        writeBytesDelegate: patchProgressCallback, token: token);
+
+                                    if (patchBytesAccum > 0)
+                                        ReportProgress();
+
+                                    patchSucceeded = true;
+                                    break;
+                                }
+                                catch (Exception ex) when (ex is not OperationCanceledException)
+                                {
+                                    lastPatchError = ex;
+                                    SharedStatic.InstanceLogger.LogWarning(
+                                        "[Patch::RunAsync] Group {Idx}: dir patch attempt failed (srcDir={Src}): {Err}",
+                                        groupIdx, sourceDir, ex.Message);
+
+                                    try
+                                    {
+                                        if (Directory.Exists(tempGroupDir))
+                                            Directory.Delete(tempGroupDir, true);
+                                    }
+                                    catch { /* ignore */ }
+
+                                    // Revert progress reported during the failed attempt so the
+                                    // next source dir attempt starts from a clean baseline.
+                                    Interlocked.Exchange(ref installProgress.DownloadedBytes, bytesBeforeAttempt);
+                                    Interlocked.Exchange(ref installProgress.StateCount, stateBeforeAttempt);
+                                    totalBytesWritten = 0;
+                                    lastReportedFileCount = 0;
+
+                                    if (HPatchZNative.IsLikelySourceDataMismatch(ex))
+                                    {
+                                        // Only skip further attempts if we're already on the full
+                                        // install root. The isolated source tree may be missing files
+                                        // that the krpdiff expects (files not listed in group.SrcFiles),
+                                        // so the full install root may still succeed.
+                                        if (string.Equals(sourceDir, installPath, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            SharedStatic.InstanceLogger.LogInformation(
+                                                "[Patch::RunAsync] Group {Idx}: krpdiff source mismatch on full install root — " +
+                                                "skipping further patch attempts for this group.",
+                                                groupIdx);
+                                            break;
+                                        }
+
+                                        SharedStatic.InstanceLogger.LogInformation(
+                                            "[Patch::RunAsync] Group {Idx}: krpdiff source mismatch on isolated source tree — " +
+                                            "will retry with full install root.",
+                                            groupIdx);
+                                    }
+                                }
+                            }
                         }
-                        catch (Exception patchEx) when (patchEx is not OperationCanceledException)
+                        finally
                         {
+                            WuwaPatchSourceStaging.TryCleanup(isolatedSrcDir);
+                        }
+
+                        if (!patchSucceeded)
+                        {
+                            Exception patchEx = lastPatchError ?? new InvalidOperationException("Dir patch failed");
                             // Patching failed (e.g. missing source file).
                             // Check whether ALL destination files already match the target
                             // hashes — if so, this group was effectively already applied
@@ -1747,6 +2043,35 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                 "[Patch::RunAsync] Patch failed for group {Idx}: {Err}. " +
                                 "Checking if destination files already match target...",
                                 groupIdx, patchEx.Message);
+
+                            foreach (var srcRef in group.SrcFiles)
+                            {
+                                if (string.IsNullOrEmpty(srcRef.Dest))
+                                    continue;
+
+                                string srcFilePath = Path.Combine(installPath,
+                                    srcRef.Dest.Replace('/', Path.DirectorySeparatorChar));
+
+                                string? srcIssue = await WuwaPatchPreflight.ValidateLocalFileAsync(
+                                    srcFilePath, srcRef.Size, srcRef.Md5 ?? "", token)
+                                    .ConfigureAwait(false);
+
+                                if (srcIssue != null)
+                                {
+                                    SharedStatic.InstanceLogger.LogWarning(
+                                        "[Patch::RunAsync]   Source mismatch after failed patch: {File} ({Reason})",
+                                        srcRef.Dest, srcIssue);
+                                }
+                                else if (string.IsNullOrEmpty(srcRef.Md5) && File.Exists(srcFilePath))
+                                {
+                                    // No manifest hash available — log actual file info to aid diagnosis.
+                                    var srcFi = new FileInfo(srcFilePath);
+                                    SharedStatic.InstanceLogger.LogWarning(
+                                        "[Patch::RunAsync]   Source file has no manifest hash — cannot verify content: " +
+                                        "{File} (size={Size})",
+                                        srcRef.Dest, srcFi.Length);
+                                }
+                            }
 
                             bool allDstMatchFallback = true;
                             foreach (var dstCheck in group.DstFiles)
@@ -1789,6 +2114,17 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                     group,
                                     $"patch failed and destinations don't match — downloading {group.DstFiles.Length} file(s) from CDN as fallback.",
                                     restoreStateCountBefore: stateCountBeforePatch);
+
+                                // Count as a patch failure for force-download escalation.
+                                consecutivePatchFailures++;
+                                if (consecutivePatchFailures >= patchFailureThreshold && !forceDirectDownload)
+                                {
+                                    forceDirectDownload = true;
+                                    SharedStatic.InstanceLogger.LogWarning(
+                                        "[Patch::RunAsync] {Count} consecutive groups failed patching — " +
+                                        "remaining groups will download directly from CDN.",
+                                        consecutivePatchFailures);
+                                }
                             }
                             else
                             {
@@ -1823,6 +2159,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         //   2. If install file already matches target → skip (previous move)
                         //   3. Otherwise → download from CDN as fallback
                         int verifiedFileCount = 0;
+                        bool groupHadPatchMismatch = false;
                         foreach (var dstRef in group.DstFiles)
                         {
                             if (string.IsNullOrEmpty(dstRef.Dest))
@@ -1877,18 +2214,19 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                         StringComparison.OrdinalIgnoreCase))
                                 {
                                     patchOutputValid = false;
+                                    groupHadPatchMismatch = true;
                                     SharedStatic.InstanceLogger.LogWarning(
                                         "[Patch::RunAsync] Post-patch MD5 mismatch for {Dst}: expected={Expected}, computed={Computed}. " +
-                                        "Checking if install file is already at target or downloading replacement.",
+                                        "Source file is likely corrupted/different build. Recovering via CDN.",
                                         dstRef.Dest, dstRef.Md5, outMd5);
                                 }
                             }
 
                             if (!patchOutputValid)
                             {
-                                // Patch output is wrong (source file was likely already at
-                                // target version from a previous interrupted move).  Check
-                                // if the file in the install directory already matches.
+                                // Patch output MD5 doesn't match — source file is likely
+                                // corrupted or from a different build. Check if the file in
+                                // the install directory already matches target.
                                 bool installedFileOk = false;
                                 if (File.Exists(finalDst) && !string.IsNullOrEmpty(dstRef.Md5))
                                 {
@@ -1981,6 +2319,25 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         SharedStatic.InstanceLogger.LogDebug(
                             "[Patch::RunAsync] Completed group {Idx}: {Count} files patched.",
                             groupIdx, group.DstFiles.Length);
+
+                        // Track consecutive patch failures for force-download escalation.
+                        if (groupHadPatchMismatch)
+                        {
+                            consecutivePatchFailures++;
+                            if (consecutivePatchFailures >= patchFailureThreshold && !forceDirectDownload)
+                            {
+                                forceDirectDownload = true;
+                                SharedStatic.InstanceLogger.LogWarning(
+                                    "[Patch::RunAsync] {Count} consecutive groups produced wrong output — " +
+                                    "source files appear to be from a different build. " +
+                                    "Remaining groups will download directly from CDN.",
+                                    consecutivePatchFailures);
+                            }
+                        }
+                        else
+                        {
+                            consecutivePatchFailures = 0;
+                        }
                     }
 
                     SharedStatic.InstanceLogger.LogInformation(
@@ -1993,7 +2350,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 // read the old source files they reference.
                 if (patchIndex.DeleteFiles.Length > 0)
                 {
-                    currentProgressState = InstallProgressState.Removing;
+                    ApplyProgressState(InstallProgressState.Removing);
                     ReportProgress();
                     foreach (var deleteEntry in patchIndex.DeleteFiles)
                     {
@@ -2106,16 +2463,159 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         "[Patch::RunAsync] Failed to write LocalGameResources.json: {Err}", ex.Message);
                 }
 
-                currentProgressState = InstallProgressState.Completed;
+                ApplyProgressState(InstallProgressState.Completed);
                 ReportProgress();
                 SharedStatic.InstanceLogger.LogInformation(
                     "[Patch::RunAsync] Patch complete. Game updated to version {Version}.", targetVer);
             }
 
             /// <summary>
-            /// Finds the krpdiff file corresponding to a destination file reference.
-            /// Tries several naming conventions.
+            /// Fetches the installed-version CDN manifest and repairs source files that do not
+            /// match canonical hashes before krpdiff apply.
             /// </summary>
+            private async Task ReconcileSourceFilesBeforeApplyAsync(
+                WuwaGameManager manager,
+                WuwaApiResponseGameConfigRef? patchConfig,
+                string installPath,
+                WuwaApiResponsePatchIndex patchIndex,
+                Action<int, long> initializeProgress,
+                Action<int> setFileProgress,
+                Action<long> addBytes,
+                Action<long> addTotalBytes,
+                Action<int> completeProgress,
+                Action<InstallProgressState> setProgressState,
+                Action reportProgress,
+                CancellationToken token)
+            {
+                var sourceRefs = WuwaSourceReconciliation.CollectSourceRefs(patchIndex);
+                if (sourceRefs.Count == 0)
+                    return;
+
+                long totalBytes = 0;
+                foreach (string dest in sourceRefs.Keys)
+                {
+                    string localPath = Path.Combine(installPath,
+                        dest.Replace('/', Path.DirectorySeparatorChar));
+                    if (File.Exists(localPath))
+                        totalBytes += new FileInfo(localPath).Length;
+                }
+
+                initializeProgress(sourceRefs.Count, totalBytes);
+
+                setProgressState(InstallProgressState.Reconciling);
+                reportProgress();
+
+                SharedStatic.InstanceLogger.LogInformation(
+                    "[Patch::RunAsync] Source reconciliation: checking {Count} source files ({Bytes} bytes to hash)...",
+                    sourceRefs.Count, totalBytes);
+
+                (bool canRepairFromCdn, WuwaGameManager.VersionResourceUrls urls) = await manager
+                    .TryResolveInstalledVersionResourceUrlsAsync(patchConfig, _owner, token)
+                    .ConfigureAwait(false);
+
+                reportProgress();
+
+                WuwaApiResponseResourceIndex? sourceIndex = null;
+
+                if (canRepairFromCdn)
+                {
+                    SharedStatic.InstanceLogger.LogInformation(
+                        "[Patch::RunAsync] Fetching source-version manifest from CDN: {Url}",
+                        urls.IndexUrl);
+                    sourceIndex = await _owner.FetchResourceIndexAsync(urls.IndexUrl, token)
+                        .ConfigureAwait(false);
+                    reportProgress();
+                }
+
+                if (sourceIndex == null)
+                {
+                    sourceIndex = WuwaGameManager.TryLoadLocalGameResourcesIndex(installPath);
+                    if (sourceIndex != null)
+                    {
+                        SharedStatic.InstanceLogger.LogInformation(
+                            "[Patch::RunAsync] Using LocalGameResources.json as source manifest fallback ({Count} entries).",
+                            sourceIndex.Resource.Length);
+                    }
+                }
+
+                if (sourceIndex == null)
+                {
+                    SharedStatic.InstanceLogger.LogWarning(
+                        "[Patch::RunAsync] No source-version manifest available; skipping CDN source repair.");
+                    return;
+                }
+
+                if (!canRepairFromCdn)
+                {
+                    manager.GetCurrentGameVersion(out GameVersion installedVersion);
+                    SharedStatic.InstanceLogger.LogWarning(
+                        "[Patch::RunAsync] Source CDN URLs could not be resolved for installed version {Version}. " +
+                        "Loaded a local manifest but automatic source repair is unavailable.",
+                        installedVersion);
+                    return;
+                }
+
+                if (sourceIndex.Resource.Length == 0)
+                {
+                    SharedStatic.InstanceLogger.LogWarning(
+                        "[Patch::RunAsync] Source-version manifest is empty; skipping CDN source repair.");
+                    return;
+                }
+
+                var lookup = WuwaSourceReconciliation.BuildResourceLookup(sourceIndex);
+
+                long perFileBytes = 0;
+                long perFileTotal = 0;
+                long hashReportAccum = 0;
+                const long hashReportThreshold = 256 << 10;
+
+                void ReportReconciliationBytes(long bytes)
+                {
+                    addBytes(bytes);
+                    perFileBytes += bytes;
+                    SharedStaticV1Ext.InvokePerFileProgress(perFileBytes, perFileTotal);
+
+                    hashReportAccum += bytes;
+                    if (hashReportAccum >= hashReportThreshold)
+                    {
+                        hashReportAccum = 0;
+                        reportProgress();
+                    }
+                }
+
+                var result = await WuwaSourceReconciliation.ReconcileSourceFilesAsync(
+                    installPath,
+                    patchIndex,
+                    lookup,
+                    manager.ApiResponseAssetUrl,
+                    urls.BaseUrl,
+                    _owner,
+                    (_, fileSize, fileIndex) =>
+                    {
+                        perFileBytes = 0;
+                        perFileTotal = fileSize;
+                        setFileProgress(fileIndex);
+                        SharedStaticV1Ext.InvokePerFileProgress(0, perFileTotal);
+                        reportProgress();
+                    },
+                    ReportReconciliationBytes,
+                    reportProgress,
+                    reportProgress,
+                    addTotalBytes,
+                    token).ConfigureAwait(false);
+
+                if (hashReportAccum > 0)
+                    reportProgress();
+
+                completeProgress(sourceRefs.Count);
+                reportProgress();
+
+                SharedStatic.InstanceLogger.LogInformation(
+                    "[Patch::RunAsync] Source reconciliation complete: checked={Checked}, repaired={Repaired}, " +
+                    "skipped unrepairable={Skipped}, already matched={AlreadyMatched}.",
+                    result.Checked, result.Repaired, result.SkippedUnrepairable, result.AlreadyMatched);
+            }
+
             /// <summary>
             /// Parses the group index N from a krpdiff filename like "X.X.X_Y.Y.Y_group_N_timestamp.krpdiff".
             /// Returns -1 if the pattern is not found.
@@ -2131,6 +2631,31 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 return int.TryParse(dest.AsSpan(numStart, numEnd - numStart), out int idx) ? idx : -1;
             }
 
+            /// <summary>
+            /// Finds the krpdiff resource entry for a group index.
+            /// </summary>
+            private static WuwaApiResponseResourceEntry? FindKrpdiffEntry(
+                WuwaApiResponseResourceEntry[] krpdiffEntries,
+                int groupIndex)
+            {
+                if (groupIndex < 0)
+                    return null;
+
+                foreach (var entry in krpdiffEntries)
+                {
+                    if (string.IsNullOrEmpty(entry.Dest))
+                        continue;
+                    if (ParseGroupIndex(entry.Dest) == groupIndex)
+                        return entry;
+                }
+
+                return null;
+            }
+
+            /// <summary>
+            /// Finds the krpdiff file corresponding to a destination file reference.
+            /// Tries several naming conventions.
+            /// </summary>
             private static string FindKrpdiffFile(
                 string patchTempPath,
                 string dstDest,
