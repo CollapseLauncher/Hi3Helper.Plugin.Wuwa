@@ -44,7 +44,7 @@ public partial class WuwaGlobalPresetConfig : WuwaPresetConfig
     }
     
     [field: AllowNull, MaybeNull]
-    public override string GameLogFileName => field ??= Path.Combine("Saved", "Logs", "Client.log");
+    public override string GameLogFileName => field ??= Path.Combine("Logs", "Client.log");
 
     [field: AllowNull, MaybeNull]
     public override string GameVendorName => field ??= VendorName;

@@ -148,14 +148,21 @@ public partial class Exports
 				InstanceLogger.LogError(e, "[Wuwa::WaitForEpicGameProcessAsync] Failed to set process priority, ignoring.");
 			}
 
-			CancellationTokenSource gameLogReaderCts = new();
-			CancellationTokenSource coopCts = CancellationTokenSource.CreateLinkedTokenSource(token, gameLogReaderCts.Token);
+			using CancellationTokenSource gameLogReaderCts = new();
+			using CancellationTokenSource coopCts = CancellationTokenSource.CreateLinkedTokenSource(token, gameLogReaderCts.Token);
 
-			_ = ReadGameLog(context, coopCts.Token);
+			Task gameLogReaderTask = ReadGameLog(context, coopCts.Token);
 			_ = TryKillEpicLauncher(context, token);
 
-			await gameProcess.WaitForExitAsync(token);
-			await gameLogReaderCts.CancelAsync();
+			try
+			{
+				await gameProcess.WaitForExitAsync(token);
+			}
+			finally
+			{
+				await gameLogReaderCts.CancelAsync();
+				await AwaitCanceledGameLogReaderAsync(gameLogReaderTask, coopCts.Token);
+			}
 		}
 
 		return true;

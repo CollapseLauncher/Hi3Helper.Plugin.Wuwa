@@ -3,12 +3,14 @@ using Hi3Helper.Plugin.Core.Management.PresetConfig;
 using Hi3Helper.Plugin.Core.Utility;
 using Hi3Helper.Plugin.Wuwa.Management;
 using Hi3Helper.Plugin.Wuwa.Management.PresetConfig;
+using Hi3Helper.Plugin.Wuwa.Utils;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -74,20 +76,64 @@ public partial class Exports
 						InstanceLogger.LogError(e, "[Wuwa::LaunchGameFromGameManagerCoreAsync()] An error has occurred while trying to set process priority, Ignoring!");
 					}
 
-					CancellationTokenSource gameLogReaderCts = new();
-					CancellationTokenSource coopCts = CancellationTokenSource.CreateLinkedTokenSource(token, gameLogReaderCts.Token);
+					using CancellationTokenSource gameLogReaderCts = new();
+					using CancellationTokenSource coopCts = CancellationTokenSource.CreateLinkedTokenSource(token, gameLogReaderCts.Token);
 
-					// Run game log reader (Create a new thread)
-					_ = ReadGameLog(context, coopCts.Token);
+					Task gameLogReaderTask = ReadGameLog(context, coopCts.Token);
 
-					await process.WaitForExitAsync(token);
-					await gameLogReaderCts.CancelAsync();
+					try
+					{
+						await WaitForStartedGameProcessExitAsync(context, process, token);
+					}
+					finally
+					{
+						await gameLogReaderCts.CancelAsync();
+						await AwaitCanceledGameLogReaderAsync(gameLogReaderTask, coopCts.Token);
+					}
 					return true;
 				}
 			}
 			finally
 			{
 				_isGameLaunching = false;
+			}
+		}
+	}
+
+	private static async Task WaitForStartedGameProcessExitAsync(
+		GameManagerExtension.RunGameFromGameManagerContext context,
+		Process startingProcess,
+		CancellationToken token)
+	{
+		if (!TryGetGameExecutablePath(context, out string? gameExecutablePath))
+		{
+			await startingProcess.WaitForExitAsync(token);
+			return;
+		}
+
+		const int maxWaitMs = 15000;
+		const int pollIntervalMs = 500;
+		Process? gameProcess = null;
+
+		for (int elapsed = 0; elapsed < maxWaitMs; elapsed += pollIntervalMs)
+		{
+			token.ThrowIfCancellationRequested();
+			gameProcess = FindExecutableProcess(gameExecutablePath);
+			if (gameProcess != null)
+				break;
+
+			await Task.Delay(pollIntervalMs, token);
+		}
+
+		using (gameProcess)
+		{
+			if (gameProcess != null)
+			{
+				await gameProcess.WaitForExitAsync(token);
+			}
+			else if (!startingProcess.HasExited)
+			{
+				await startingProcess.WaitForExitAsync(token);
 			}
 		}
 	}
@@ -355,36 +401,81 @@ public partial class Exports
 			return;
 		}
 
-		string gameLogPath = Path.Combine(gameAppDataPath, gameLogFileName);
-		await Task.Delay(250, token);
-
-		int retry = 5;
-		while (!File.Exists(gameLogPath) && retry >= 0)
-		{
-			// Delays for 5 seconds to wait the game log existence
-			await Task.Delay(1000, token);
-			--retry;
-		}
-
-		if (retry <= 0)
-		{
-			return;
-		}
-
 		GameManagerExtension.PrintGameLog? printCallback = context.PrintGameLogCallback;
+		if (printCallback == null)
+			return;
 
-		await using FileStream fileStream = File.Open(gameLogPath, FileMode.OpenOrCreate, FileAccess.Read, FileShare.ReadWrite);
-		using StreamReader reader = new StreamReader(fileStream);
+		string gameLogPath = Path.Combine(gameAppDataPath, gameLogFileName);
+		byte[] header = new byte[3];
 
-		fileStream.Position = 0;
-		while (!token.IsCancellationRequested)
+		try
 		{
-			while (await reader.ReadLineAsync(token) is { } line)
+			while (!token.IsCancellationRequested)
 			{
-				PassStringLineToCallback(printCallback, line);
-			}
+				while (!File.Exists(gameLogPath))
+					await Task.Delay(250, token);
 
-			await Task.Delay(250, token);
+				try
+				{
+					await using FileStream fileStream = new(
+						gameLogPath,
+						FileMode.Open,
+						FileAccess.Read,
+						FileShare.ReadWrite | FileShare.Delete,
+						bufferSize: 4096,
+						FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+					int headerBytesRead = 0;
+					while (headerBytesRead < header.Length)
+					{
+						int read = await fileStream.ReadAsync(
+							header.AsMemory(headerBytesRead), token);
+						if (read == 0)
+						{
+							await Task.Delay(100, token);
+							continue;
+						}
+
+						headerBytesRead += read;
+					}
+
+					bool isEncrypted = IsEncryptedWuwaLogHeader(header);
+					if (!isEncrypted)
+						fileStream.Position = 0;
+
+					using WuwaLogDecodeStream? decodeStream = isEncrypted
+						? new WuwaLogDecodeStream(fileStream)
+						: null;
+					Stream contentStream = (Stream?)decodeStream ?? fileStream;
+					using StreamReader reader = new(
+						contentStream,
+						Encoding.UTF8,
+						detectEncodingFromByteOrderMarks: true,
+						bufferSize: 4096,
+						leaveOpen: true);
+
+					while (!token.IsCancellationRequested)
+					{
+						while (await reader.ReadLineAsync(token) is { } line)
+							PassStringLineToCallback(printCallback, line);
+
+						var currentLog = new FileInfo(gameLogPath);
+						if (!currentLog.Exists || currentLog.Length < fileStream.Position)
+							break;
+
+						await Task.Delay(250, token);
+					}
+				}
+				catch (IOException) when (!token.IsCancellationRequested)
+				{
+					await Task.Delay(250, token);
+				}
+
+			}
+		}
+		catch (OperationCanceledException) when (token.IsCancellationRequested)
+		{
+			// Expected when the game exits.
 		}
 
 		return;
@@ -395,6 +486,33 @@ public partial class Exports
 			int lineLen = line.Length;
 
 			invoke?.Invoke(lineP, lineLen, 0);
+		}
+	}
+
+	private static bool IsEncryptedWuwaLogHeader(ReadOnlySpan<byte> header)
+	{
+		if (header.Length < 3)
+			return false;
+
+		return header[0] switch
+		{
+			0x00 => header[1] == 0x54 && header[2] == 0x50,
+			0xEF => header[1] == 0xBB && header[2] == 0xBF,
+			0x4A => header[1] == 0x1E && header[2] == 0x1A,
+			0xA5 => header[1] == 0xF1 && header[2] == 0xF5,
+			_ => false
+		};
+	}
+
+	private static async Task AwaitCanceledGameLogReaderAsync(Task readerTask, CancellationToken token)
+	{
+		try
+		{
+			await readerTask;
+		}
+		catch (OperationCanceledException) when (token.IsCancellationRequested)
+		{
+			// Expected when the game exits.
 		}
 	}
 }
