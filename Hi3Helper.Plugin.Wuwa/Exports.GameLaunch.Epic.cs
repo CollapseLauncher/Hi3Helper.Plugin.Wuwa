@@ -133,36 +133,33 @@ public partial class Exports
 			return false;
 		}
 
-		using (gameProcess)
+		SharedStatic.InstanceLogger.LogInformation(
+			"[Wuwa::WaitForEpicGameProcessAsync] Found game process PID={Pid}", gameProcess.Id);
+
+		try
 		{
-			SharedStatic.InstanceLogger.LogInformation(
-				"[Wuwa::WaitForEpicGameProcessAsync] Found game process PID={Pid}", gameProcess.Id);
+			gameProcess.PriorityBoostEnabled = isRunBoosted;
+			gameProcess.PriorityClass = processPriority;
+		}
+		catch (Exception e)
+		{
+			InstanceLogger.LogError(e, "[Wuwa::WaitForEpicGameProcessAsync] Failed to set process priority, ignoring.");
+		}
 
-			try
-			{
-				gameProcess.PriorityBoostEnabled = isRunBoosted;
-				gameProcess.PriorityClass = processPriority;
-			}
-			catch (Exception e)
-			{
-				InstanceLogger.LogError(e, "[Wuwa::WaitForEpicGameProcessAsync] Failed to set process priority, ignoring.");
-			}
+		using CancellationTokenSource gameLogReaderCts = new();
+		using CancellationTokenSource coopCts = CancellationTokenSource.CreateLinkedTokenSource(token, gameLogReaderCts.Token);
 
-			using CancellationTokenSource gameLogReaderCts = new();
-			using CancellationTokenSource coopCts = CancellationTokenSource.CreateLinkedTokenSource(token, gameLogReaderCts.Token);
+		Task gameLogReaderTask = ReadGameLog(context, coopCts.Token);
+		_ = TryKillEpicLauncher(context, token);
 
-			Task gameLogReaderTask = ReadGameLog(context, coopCts.Token);
-			_ = TryKillEpicLauncher(context, token);
-
-			try
-			{
-				await gameProcess.WaitForExitAsync(token);
-			}
-			finally
-			{
-				await gameLogReaderCts.CancelAsync();
-				await AwaitCanceledGameLogReaderAsync(gameLogReaderTask, coopCts.Token);
-			}
+		try
+		{
+			await WaitForGameProcessChainExitAsync(gameExecutablePath, gameProcess, token);
+		}
+		finally
+		{
+			await gameLogReaderCts.CancelAsync();
+			await AwaitCanceledGameLogReaderAsync(gameLogReaderTask, coopCts.Token);
 		}
 
 		return true;
