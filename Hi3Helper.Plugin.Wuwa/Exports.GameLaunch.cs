@@ -25,6 +25,7 @@ public partial class Exports
 	/// wrapper -> game-executable hand-off.
 	/// </summary>
 	private volatile bool _isGameLaunching;
+	private int _isHotFixRestartPending;
 
 	/// <inheritdoc/>
 	protected override (bool IsSupported, Task<bool> Task) LaunchGameFromGameManagerCoreAsync(GameManagerExtension.RunGameFromGameManagerContext context, string? startArgument, bool isRunBoosted, ProcessPriorityClass processPriority, CancellationToken token)
@@ -33,6 +34,7 @@ public partial class Exports
 
 		async Task<bool> Impl()
 		{
+			Interlocked.Exchange(ref _isHotFixRestartPending, 0);
 			_isGameLaunching = true;
 			try
 			{
@@ -100,7 +102,7 @@ public partial class Exports
 		}
 	}
 
-	private static async Task WaitForStartedGameProcessExitAsync(
+	private async Task WaitForStartedGameProcessExitAsync(
 		GameManagerExtension.RunGameFromGameManagerContext context,
 		Process startingProcess,
 		CancellationToken token)
@@ -125,15 +127,58 @@ public partial class Exports
 			await Task.Delay(pollIntervalMs, token);
 		}
 
-		using (gameProcess)
+		if (gameProcess != null)
 		{
-			if (gameProcess != null)
+			await WaitForGameProcessChainExitAsync(gameExecutablePath, gameProcess, token);
+		}
+		else if (!startingProcess.HasExited)
+		{
+			await startingProcess.WaitForExitAsync(token);
+		}
+	}
+
+	private async Task WaitForGameProcessChainExitAsync(
+		string gameExecutablePath,
+		Process gameProcess,
+		CancellationToken token)
+	{
+		const int restartWaitMs = 120000;
+		const int pollIntervalMs = 250;
+		Process? currentProcess = gameProcess;
+
+		while (currentProcess != null)
+		{
+			using (currentProcess)
+				await currentProcess.WaitForExitAsync(token);
+
+			if (Interlocked.Exchange(ref _isHotFixRestartPending, 0) == 0)
+				return;
+
+			InstanceLogger.LogInformation(
+				"[Wuwa::WaitForGameProcessChainExitAsync] Hotfix restart requested; waiting for replacement game process.");
+
+			currentProcess = null;
+			for (int elapsed = 0; elapsed < restartWaitMs; elapsed += pollIntervalMs)
 			{
-				await gameProcess.WaitForExitAsync(token);
+				token.ThrowIfCancellationRequested();
+				currentProcess = FindExecutableProcess(gameExecutablePath);
+				if (currentProcess != null)
+					break;
+
+				await Task.Delay(pollIntervalMs, token);
 			}
-			else if (!startingProcess.HasExited)
+
+			if (currentProcess == null)
 			{
-				await startingProcess.WaitForExitAsync(token);
+				InstanceLogger.LogWarning(
+					"[Wuwa::WaitForGameProcessChainExitAsync] Replacement game process did not appear within {WaitMs}ms.",
+					restartWaitMs);
+			}
+			else
+			{
+				InstanceLogger.LogInformation(
+					"[Wuwa::WaitForGameProcessChainExitAsync] Attached to restarted game process PID={Pid}.",
+					currentProcess.Id);
 			}
 		}
 	}
@@ -385,7 +430,7 @@ public partial class Exports
 		return true;
 	}
 
-	private static async Task ReadGameLog(GameManagerExtension.RunGameFromGameManagerContext context, CancellationToken token)
+	private async Task ReadGameLog(GameManagerExtension.RunGameFromGameManagerContext context, CancellationToken token)
 	{
 		if (context is not { PresetConfig: PluginPresetConfigBase presetConfig })
 		{
@@ -457,7 +502,12 @@ public partial class Exports
 					while (!token.IsCancellationRequested)
 					{
 						while (await reader.ReadLineAsync(token) is { } line)
+						{
+							if (line.Contains("HotFixRestartToCompleteHotFixWin", StringComparison.Ordinal))
+								Interlocked.Exchange(ref _isHotFixRestartPending, 1);
+
 							PassStringLineToCallback(printCallback, line);
+						}
 
 						var currentLog = new FileInfo(gameLogPath);
 						if (!currentLog.Exists || currentLog.Length < fileStream.Position)
