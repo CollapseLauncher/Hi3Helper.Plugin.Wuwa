@@ -27,6 +27,10 @@ internal partial class WuwaGameInstaller : GameInstallerBase
     private const long   Md5CheckSizeThreshold   = 50L * 1024L * 1024L; // 50 MB
     private const double ExCacheDurationInMinute = 10d;
 
+    internal static bool IsBinaryPatchFileName(string path) =>
+        path.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase) ||
+        path.EndsWith(".hp", StringComparison.OrdinalIgnoreCase);
+
     private DateTimeOffset _cacheExpiredUntil = DateTimeOffset.MinValue;
     private WuwaApiResponseResourceIndex? _currentIndex;
 
@@ -95,7 +99,10 @@ internal partial class WuwaGameInstaller : GameInstallerBase
         await InitAsync(token).ConfigureAwait(false);
         SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetGameDownloadedSizeAsyncInner] InitAsync completed");
 
-        long result = gameInstallerKind switch
+        long result = gameInstallerKind == GameInstallerKind.Update &&
+                      TryGetKnownHotfix(out _, out _)
+            ? await GetKnownHotfixDownloadedSizeAsync(token).ConfigureAwait(false)
+            : gameInstallerKind switch
         {
             GameInstallerKind.None => 0L,
             GameInstallerKind.Update or GameInstallerKind.Preload =>
@@ -127,6 +134,12 @@ internal partial class WuwaGameInstaller : GameInstallerBase
         // Ensure API/init is ready
         await InitAsync(token).ConfigureAwait(false);
         SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetGameSizeAsyncInner] InitAsync completed");
+
+        if (gameInstallerKind == GameInstallerKind.Update &&
+            TryGetKnownHotfix(out WuwaKnownHotfixPatch hotfix, out _))
+        {
+            return hotfix.DownloadSize;
+        }
 
         // For update/preload, compute from patch index instead of full resource index
         if (gameInstallerKind is GameInstallerKind.Update or GameInstallerKind.Preload)
@@ -178,6 +191,9 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 
     protected override Task StartUpdateAsyncInner(InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
     {
+        if (TryGetKnownHotfix(out WuwaKnownHotfixPatch hotfix, out string gamePath))
+            return StartKnownHotfixAsync(hotfix, gamePath, progressDelegate, progressStateDelegate, token);
+
         // Update: download and apply krpdiff patches (or use pre-downloaded preload files)
         return StartPatchCoreAsync(GameInstallerKind.Update, onlyDownload: false, progressDelegate, progressStateDelegate, token);
     }
