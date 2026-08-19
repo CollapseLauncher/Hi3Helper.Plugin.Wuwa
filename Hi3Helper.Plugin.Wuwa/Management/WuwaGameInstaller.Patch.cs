@@ -102,7 +102,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 if (string.IsNullOrEmpty(entry.Dest))
                     continue;
 
-                if (entry.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase))
+                if (IsBinaryPatchFileName(entry.Dest))
                     krpCount++;
                 else
                     fullCount++;
@@ -544,15 +544,10 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 string installPath = _owner.EnsureAndGetGamePath();
                 string patchTempPath = Path.Combine(installPath, "TempPath", PatchTempDirName);
 
-                // Initialize progress tracking
-                var installProgress = new InstallProgress
-                {
-                    // Initialize totals to 1 so UI shows "0/1" instead of "0/0" if cancelled during Preparing
-                    TotalStateToComplete = 1,
-                    TotalCountToDownload = 1,
-                    StateCount = 0,
-                    DownloadedCount = 0
-                };
+                // Numeric totals are unknown until the patch index has been parsed.
+                // Do not publish placeholder values that the host may retain for the
+                // subsequent download phase.
+                var installProgress = new InstallProgress();
                 var currentProgressState = InstallProgressState.Idle;
 
                 void ApplyProgressState(InstallProgressState state)
@@ -612,7 +607,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                 // ── Step 1: Resolve the correct patch config ──
                 ApplyProgressState(InstallProgressState.Preparing);
-                ReportProgress();
 
                 manager.GetCurrentGameVersion(out GameVersion currentVersion);
 
@@ -651,10 +645,10 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 var patchIndex = await _owner.DownloadPatchIndexAsync(patchIndexUrl, token).ConfigureAwait(false)
                     ?? throw new InvalidOperationException($"Failed to download or parse patch index from {patchIndexUrl}");
 
-                // ── Step 3: Filter .krpdiff entries only ──
+                // ── Step 3: Filter binary-patch entries (.krpdiff and newer .hp files) ──
                 var krpdiffEntries = patchIndex.Resource
                     .Where(e => !string.IsNullOrEmpty(e.Dest) &&
-                                e.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase))
+                                IsBinaryPatchFileName(e.Dest))
                     .ToArray();
 
                 SharedStatic.InstanceLogger.LogInformation(
@@ -939,7 +933,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     foreach (var entry in krpdiffEntries)
                     {
                         if (string.IsNullOrEmpty(entry.Dest)) continue;
-                        int gIdx = ParseGroupIndex(entry.Dest);
+                        int gIdx = ParseGroupIndex(entry.Dest, patchIndex.GroupInfos.Length);
                         if (gIdx >= 0)
                             groupToKrpdiffDest[gIdx] = entry.Dest;
                     }
@@ -1049,7 +1043,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     // These are files not covered by any group (e.g. new files added in the target version).
                     var fullReplacementToDownload = patchIndex.Resource
                         .Where(e => !string.IsNullOrEmpty(e.Dest) &&
-                                    !e.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase))
+                                    !IsBinaryPatchFileName(e.Dest))
                         .ToArray();
 
                     if (fullReplacementToDownload.Length > 0)
@@ -1146,7 +1140,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             if (string.IsNullOrEmpty(entry.Dest))
                                 return;
 
-                            bool isKrpdiff = entry.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase);
+                            bool isKrpdiff = IsBinaryPatchFileName(entry.Dest);
                             string relativePath = entry.Dest.Replace('/', Path.DirectorySeparatorChar);
                             string outputPath = Path.Combine(patchTempPath, relativePath);
 
@@ -1269,7 +1263,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     if (string.IsNullOrEmpty(entry.Dest))
                         continue;
 
-                    bool isKrpdiff = entry.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase);
+                    bool isKrpdiff = IsBinaryPatchFileName(entry.Dest);
                     string relativePath = entry.Dest.Replace('/', Path.DirectorySeparatorChar);
                     string filePath = Path.Combine(patchTempPath, relativePath);
 
@@ -1460,7 +1454,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 {
                     if (string.IsNullOrEmpty(entry.Dest))
                         continue;
-                    if (entry.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase))
+                    if (IsBinaryPatchFileName(entry.Dest))
                         continue;
                     resourceDestLookup.TryAdd(entry.Dest, entry);
                 }
@@ -1705,9 +1699,11 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             patchTempPath,
                             group.DstFiles[0].Dest ?? "",
                             krpdiffEntries,
-                            groupIdx);
+                            groupIdx,
+                            patchIndex.GroupInfos.Length);
 
-                        WuwaApiResponseResourceEntry? krpdiffEntry = FindKrpdiffEntry(krpdiffEntries, groupIdx);
+                        WuwaApiResponseResourceEntry? krpdiffEntry =
+                            FindKrpdiffEntry(krpdiffEntries, groupIdx, patchIndex.GroupInfos.Length);
                         if (krpdiffEntry != null)
                         {
                             string? krpdiffIssue = await WuwaPatchPreflight.ValidateLocalFileAsync(
@@ -2381,7 +2377,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 // ── Step 10: Also handle non-krpdiff resource files (full replacement files) ──
                 var fullReplacementEntries = patchIndex.Resource
                     .Where(e => !string.IsNullOrEmpty(e.Dest) &&
-                                !e.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase))
+                                !IsBinaryPatchFileName(e.Dest))
                     .ToArray();
 
                 if (fullReplacementEntries.Length > 0)
@@ -2617,18 +2613,46 @@ namespace Hi3Helper.Plugin.Wuwa.Management
             }
 
             /// <summary>
-            /// Parses the group index N from a krpdiff filename like "X.X.X_Y.Y.Y_group_N_timestamp.krpdiff".
+            /// Parses the group index from legacy krpdiff names and newer
+            /// "ManifestResource_gN_...hp" / "ManifestResource_ls_...hp" names.
             /// Returns -1 if the pattern is not found.
             /// </summary>
-            private static int ParseGroupIndex(string dest)
+            private static int ParseGroupIndex(string dest, int groupCount = 0)
             {
                 const string marker = "_group_";
                 int pos = dest.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-                if (pos < 0) return -1;
-                int numStart = pos + marker.Length;
-                int numEnd = dest.IndexOf('_', numStart);
-                if (numEnd < 0) return -1;
-                return int.TryParse(dest.AsSpan(numStart, numEnd - numStart), out int idx) ? idx : -1;
+                if (pos >= 0)
+                {
+                    int numStart = pos + marker.Length;
+                    int numEnd = numStart;
+                    while (numEnd < dest.Length && char.IsAsciiDigit(dest[numEnd]))
+                        numEnd++;
+                    return numEnd > numStart &&
+                           int.TryParse(dest.AsSpan(numStart, numEnd - numStart), out int legacyIndex)
+                        ? legacyIndex
+                        : -1;
+                }
+
+                string fileName = Path.GetFileName(dest);
+                const string manifestGroupMarker = "ManifestResource_g";
+                if (fileName.StartsWith(manifestGroupMarker, StringComparison.OrdinalIgnoreCase))
+                {
+                    int numStart = manifestGroupMarker.Length;
+                    int numEnd = numStart;
+                    while (numEnd < fileName.Length && char.IsAsciiDigit(fileName[numEnd]))
+                        numEnd++;
+                    return numEnd > numStart &&
+                           int.TryParse(fileName.AsSpan(numStart, numEnd - numStart), out int manifestIndex)
+                        ? manifestIndex
+                        : -1;
+                }
+
+                // The official updater places "ls" after its numbered groups. The captured
+                // 3.5.11 -> 3.5.12 update contains g0..g12 plus this final group.
+                return groupCount > 0 &&
+                       fileName.StartsWith("ManifestResource_ls_", StringComparison.OrdinalIgnoreCase)
+                    ? groupCount - 1
+                    : -1;
             }
 
             /// <summary>
@@ -2636,7 +2660,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
             /// </summary>
             private static WuwaApiResponseResourceEntry? FindKrpdiffEntry(
                 WuwaApiResponseResourceEntry[] krpdiffEntries,
-                int groupIndex)
+                int groupIndex,
+                int groupCount)
             {
                 if (groupIndex < 0)
                     return null;
@@ -2645,7 +2670,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 {
                     if (string.IsNullOrEmpty(entry.Dest))
                         continue;
-                    if (ParseGroupIndex(entry.Dest) == groupIndex)
+                    if (ParseGroupIndex(entry.Dest, groupCount) == groupIndex)
                         return entry;
                 }
 
@@ -2660,7 +2685,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 string patchTempPath,
                 string dstDest,
                 WuwaApiResponseResourceEntry[] krpdiffEntries,
-                int groupIndex = -1)
+                int groupIndex = -1,
+                int groupCount = 0)
             {
                 // Strategy 0 (preferred): Find krpdiff by matching group index in its filename
                 if (groupIndex >= 0)
@@ -2668,7 +2694,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     foreach (var entry in krpdiffEntries)
                     {
                         if (string.IsNullOrEmpty(entry.Dest)) continue;
-                        if (ParseGroupIndex(entry.Dest) == groupIndex)
+                        if (ParseGroupIndex(entry.Dest, groupCount) == groupIndex)
                         {
                             string path = Path.Combine(patchTempPath,
                                 entry.Dest.Replace('/', Path.DirectorySeparatorChar));
@@ -2698,10 +2724,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     if (string.IsNullOrEmpty(entry.Dest))
                         continue;
 
-                    string entryBaseName = Path.GetFileNameWithoutExtension(
-                        entry.Dest.EndsWith(".krpdiff", StringComparison.OrdinalIgnoreCase)
-                            ? entry.Dest[..^".krpdiff".Length]
-                            : entry.Dest);
+                    string entryBaseName = Path.GetFileNameWithoutExtension(entry.Dest);
 
                     if (string.Equals(baseName, entryBaseName, StringComparison.OrdinalIgnoreCase))
                     {

@@ -66,6 +66,7 @@ internal partial class WuwaGameManager : GameManagerBase
 
     internal string? GameResourceBaseUrl { get; set; }
     internal string? GameResourceBasisPath { get; set; }
+    internal WuwaKnownHotfixPatch? AvailableHotfixPatch { get; private set; }
     private bool IsInitialized { get; set; }
 
     /// <summary>
@@ -187,17 +188,28 @@ internal partial class WuwaGameManager : GameManagerBase
     {
         get
         {
-            bool result = IsInstalled && (ApiGameVersion != CurrentGameVersion || HasPendingPreloadPatch);
+            bool result = IsInstalled &&
+                          (ApiGameVersion != CurrentGameVersion ||
+                           HasPendingPreloadPatch ||
+                           HasKnownHotfixUpdate);
             if (_lastHasUpdate != result)
             {
                 _lastHasUpdate = result;
                 SharedStatic.InstanceLogger.LogDebug(
-                    "[WuwaGameManager::HasUpdate] IsInstalled={IsInstalled}, ApiGameVersion={ApiVer}, CurrentGameVersion={CurVer}, VersionMismatch={Mismatch}, HasPendingPreloadPatch={Pending} => HasUpdate={Result}",
-                    IsInstalled, ApiGameVersion, CurrentGameVersion, ApiGameVersion != CurrentGameVersion, HasPendingPreloadPatch, result);
+                    "[WuwaGameManager::HasUpdate] IsInstalled={IsInstalled}, ApiGameVersion={ApiVer}, CurrentGameVersion={CurVer}, VersionMismatch={Mismatch}, HasPendingPreloadPatch={Pending}, HasKnownHotfix={Hotfix} => HasUpdate={Result}",
+                    IsInstalled, ApiGameVersion, CurrentGameVersion, ApiGameVersion != CurrentGameVersion,
+                    HasPendingPreloadPatch, HasKnownHotfixUpdate, result);
             }
             return result;
         }
     }
+
+    internal bool HasKnownHotfixUpdate =>
+        !string.IsNullOrEmpty(CurrentGameInstallPath) &&
+        CurrentGameVersion == ApiGameVersion &&
+        AvailableHotfixPatch is { } patch &&
+        CurrentGameVersion.ToString() == patch.PackageVersion &&
+        patch.CanApply(CurrentGameInstallPath);
 
     /// <summary>
     /// Checks if preloaded patch files exist on disk and the predownload window has closed
@@ -214,7 +226,9 @@ internal partial class WuwaGameManager : GameManagerBase
             // Check if there are actual preload files (version marker or krpdiff files)
             string versionMarkerPath = Path.Combine(patchTempPath, ".version");
             bool hasVersionMarker = File.Exists(versionMarkerPath);
-            bool hasKrpdiffFiles = Directory.EnumerateFiles(patchTempPath, "*.krpdiff", SearchOption.AllDirectories).Any();
+            bool hasKrpdiffFiles = Directory
+                .EnumerateFiles(patchTempPath, "*", SearchOption.AllDirectories)
+                .Any(WuwaGameInstaller.IsBinaryPatchFileName);
             
             if (!hasVersionMarker && !hasKrpdiffFiles)
             {
@@ -403,7 +417,50 @@ internal partial class WuwaGameManager : GameManagerBase
             }
         }
 
+        await DiscoverHotfixAsync(token).ConfigureAwait(false);
+
         return 0;
+    }
+
+    private async Task DiscoverHotfixAsync(CancellationToken token)
+    {
+        AvailableHotfixPatch = null;
+        if (!IsInstalled || string.IsNullOrEmpty(CurrentGameInstallPath) ||
+            CurrentGameVersion != ApiGameVersion)
+        {
+            return;
+        }
+
+        try
+        {
+            AvailableHotfixPatch = await WuwaKnownHotfixPatch.DiscoverAsync(
+                CurrentGameInstallPath,
+                CurrentGameVersion.ToString(),
+                ApiDownloadHttpClient,
+                token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameManager::DiscoverHotfixAsync] Dynamic discovery failed: {Error}",
+                ex.Message);
+        }
+
+        if (AvailableHotfixPatch != null)
+        {
+            string transitions = string.Join(", ", AvailableHotfixPatch.Components.Select(
+                x => $"{x.ResourceType} {x.SourceVersion} -> {x.TargetVersion}"));
+            SharedStatic.InstanceLogger.LogInformation(
+                "[WuwaGameManager::DiscoverHotfixAsync] Hotfix available: {Transitions}, " +
+                "{Count} patch files, {Bytes} bytes",
+                transitions,
+                AvailableHotfixPatch.Files.Count(),
+                AvailableHotfixPatch.DownloadSize);
+        }
     }
 
     private void LogGameStateOnce()
