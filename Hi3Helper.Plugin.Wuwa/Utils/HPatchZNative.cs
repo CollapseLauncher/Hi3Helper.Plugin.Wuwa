@@ -78,7 +78,8 @@ internal static class HPatchZNative
             // doesn't match the krpdiff's expected oldDataSize. This is deterministic
             // and retrying buffer modes cannot fix it.
             if (cur is InvalidDataException &&
-                cur.Message.Contains("unmatch size", StringComparison.OrdinalIgnoreCase))
+                (cur.Message.Contains("unmatch size", StringComparison.OrdinalIgnoreCase) ||
+                 cur.Message.Contains("source file size mismatch", StringComparison.OrdinalIgnoreCase)))
                 return true;
         }
 
@@ -196,6 +197,7 @@ internal static class HPatchZNative
 
                 var patcher = new HDiffPatch();
                 patcher.Initialize(diffFilePath);
+                patcher.DirPatchFormat = DirectoryPatchFormat.Kuro;
                 RunDirPatch(patcher, sourceDir, outputDir, mode, writeBytesDelegate, token);
 
                 SharedStatic.InstanceLogger.LogDebug(
