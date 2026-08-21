@@ -2213,7 +2213,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                     groupHadPatchMismatch = true;
                                     SharedStatic.InstanceLogger.LogWarning(
                                         "[Patch::RunAsync] Post-patch MD5 mismatch for {Dst}: expected={Expected}, computed={Computed}. " +
-                                        "Source file is likely corrupted/different build. Recovering via CDN.",
+                                        "Patch output failed integrity verification. Recovering via CDN.",
                                         dstRef.Dest, dstRef.Md5, outMd5);
                                 }
                             }
