@@ -14,22 +14,23 @@ internal sealed class WuwaGameSettings
     private const string GameUserSettingsSection = "/Script/Engine.GameUserSettings";
     private const string LocalKeyPrefix = "local.";
 
+    // See docs/wuwa-settings-mappings.md for the versioned mapping sources and limitations.
     private static readonly LocalSettingSection[] LocalSettingSections =
     [
         new("Graphics", [
             Toggle("AutoAdjustImageQuality", "Automatically adjust image quality"),
-            Level("ImageQuality", "Image quality preset", 4),
-            Level("ImageDetail", "Image detail", 4),
-            Level("ShadowQuality", "Shadow quality", 4),
-            Level("AntiAliasing", "Anti-aliasing", 4),
-            Level("AnisoLevel", "Anisotropic filtering", 4),
-            Level("MotionBlur", "Motion blur", 3),
-            Level("NiagaraQuality", "Effects quality", 4),
-            Level("NpcDensity", "NPC density", 4),
-            Level("VegetationDensity", "Vegetation density", 4),
-            Level("LoadingRangeScaleLevel", "View distance", 4),
-            Level("VolumeFog", "Volumetric fog", 4),
-            Level("VolumeLight", "Volumetric lighting", 4),
+            Choice("ImageQuality", "Graphics quality", [new("0", "Ultra Performance"), new("1", "Performance"), new("2", "Balanced"), new("3", "Quality"), new("4", "High Quality"), new("5", "Ultra Quality")]),
+            Choice("ImageDetail", "LOD bias", [new("0", "Low"), new("1", "Medium"), new("2", "High"), new("3", "Ultra High")]),
+            Choice("ShadowQuality", "Shadow quality", [new("0", "Low"), new("1", "Medium"), new("2", "High"), new("3", "Ultra High")]),
+            Choice("AntiAliasing", "Anti-aliasing", [new("0", "Off"), new("1", "On")]),
+            Choice("AnisoLevel", "Anisotropic filtering", [new("0", "1x"), new("1", "2x"), new("2", "4x"), new("3", "8x"), new("4", "16x")]),
+            Choice("MotionBlur", "Motion blur", [new("0", "Off"), new("1", "Low"), new("2", "Medium"), new("3", "High")]),
+            Choice("NiagaraQuality", "Special effects quality", [new("0", "Low"), new("1", "Medium"), new("2", "High")]),
+            Choice("NpcDensity", "Crowd density", [new("0", "Low"), new("1", "Medium"), new("2", "High")]),
+            Choice("VegetationDensity", "Foliage density", [new("0", "Low"), new("1", "Medium"), new("2", "High"), new("3", "Ultra High")]),
+            Choice("LoadingRangeScaleLevel", "Render distance", [new("0", "Default"), new("1", "Far"), new("2", "Farthest")]),
+            Choice("VolumeFog", "Volumetric fog", [new("0", "Off"), new("1", "Low"), new("2", "Medium"), new("3", "High")]),
+            Choice("VolumeLight", "Volumetric lighting", [new("0", "Off"), new("1", "On")]),
             Toggle("SceneAo", "Ambient occlusion"),
             Toggle("BloomEnable", "Bloom"),
             Toggle("AutoExposure", "Automatic exposure"),
@@ -38,11 +39,11 @@ internal sealed class WuwaGameSettings
             Toggle("VegetationDither", "Vegetation dithering"),
             Toggle("WaterInteract", "Water interaction"),
             Toggle("FlowAdaptation", "Flow adaptation"),
-            Toggle("RayTracing", "Ray tracing"),
+            Choice("RayTracing", "Ray tracing", [new("0", "Off"), new("1", "Low"), new("2", "Medium"), new("3", "High")]),
             Toggle("NvidiaSuperSamplingEnable", "NVIDIA super sampling"),
             Choice("NvidiaSuperSamplingQuality", "NVIDIA super-sampling preset", [
-                new("99", "Automatic"), new("0", "Preset 0"), new("1", "Preset 1"),
-                new("2", "Preset 2"), new("3", "Preset 3"), new("4", "Preset 4")
+                new("99", "Auto"), new("-2", "Ultimate Performance"), new("-1", "Performance"),
+                new("0", "Balanced"), new("1", "Quality"), new("3", "DLAA")
             ]),
             Slider("NvidiaSuperSamplingSharpness", "NVIDIA sharpening", 0, 100),
             Slider("Brightness", "Brightness", -100, 100),
@@ -74,33 +75,37 @@ internal sealed class WuwaGameSettings
             Slider("GamepadLeftStickDeadZone", "Left-stick dead zone", 0, 100),
             Slider("GamepadRightStickDeadZone", "Right-stick dead zone", 0, 100),
             Slider("JoystickShakeStrength", "Controller vibration strength", 0, 100),
-            Level("JoystickShakeType", "Controller vibration mode", 3),
-            Level("CameraShakeStrength", "Camera shake", 3),
-            Level("CommonSpringArmLength", "Exploration camera distance", 3),
-            Level("FightSpringArmLength", "Combat camera distance", 3),
-            Level("KeyboardLockEnemyMode", "Keyboard enemy-lock mode", 3),
-            Level("GamepadLockEnemyMode", "Controller enemy-lock mode", 3),
-            Level("SkillLockEnemyMode", "Skill enemy-lock mode", 3)
+            Choice("JoystickShakeType", "Controller vibration range", [new("0", "Full"), new("1", "Partial"), new("2", "Off")]),
+            Choice("CameraShakeStrength", "Camera shake intensity", [new("0", "Low"), new("1", "Medium"), new("2", "High")]),
+            Slider("CommonSpringArmLength", "Regular camera distance", 0, 100),
+            Slider("FightSpringArmLength", "Combat camera distance", 0, 100),
+            Choice("KeyboardLockEnemyMode", "Keyboard enemy-lock mode", [], "The in-game mapping for this internal setting is unverified. Its current value is preserved."),
+            Choice("GamepadLockEnemyMode", "Controller enemy-lock mode", [], "The in-game mapping for this internal setting is unverified. Its current value is preserved."),
+            Choice("SkillLockEnemyMode", "Skill enemy-lock mode", [], "The in-game mapping for this internal setting is unverified. Its current value is preserved.")
         ]),
         new("Gameplay and accessibility", [
-            Level("EnemyHitDisplayMode", "Enemy hit display", 3),
-            Level("FlyControlMode", "Flight control mode", 3),
+            Choice("EnemyHitDisplayMode", "Enemy hit flash", [new("0", "Off"), new("1", "On")]),
+            Choice("FlyControlMode", "Flight control mode", [], "The in-game mapping for this internal setting is unverified. Its current value is preserved."),
             Toggle("ShowDamage", "Show damage numbers"),
             Toggle("ShowOtherName", "Show other player names"),
             Toggle("SubTitleOption", "Subtitles"),
             Toggle("PhotoAndShareShowPlayerName", "Show player name in photos"),
             Slider("WalkOrRunRate", "Walk/run transition", 0, 1, 0.05),
             Toggle("EyeProtection", "Eye-protection mode"),
-            Level("EyeProtectionMode", "Eye-protection preset", 3),
+            Choice("EyeProtectionMode", "Eye-protection preset", [], "The in-game mapping for this internal setting is unverified. Its current value is preserved."),
             Slider("EyeProtectionBrightness", "Eye-protection brightness", 0, 1, 0.05),
             Slider("EyeProtectionStrength", "Eye-protection strength", 0, 1, 0.05),
             Slider("EyeProtectionTexture", "Eye-protection texture", 0, 1, 0.05),
             Slider("EyeProtectionTemp", "Eye-protection color temperature", 1000, 10000, 100)
         ]),
         new("Language", [
-            Level("TextLanguage", "Text language", 20),
-            Level("VoiceLanguage", "Voice-over language", 20)
-        ], "Language values are game-defined numeric identifiers. Change them only if you know the identifier used by your installed client.")
+            Choice("TextLanguage", "Text language", [
+                new("0", "Simplified Chinese"), new("5", "Traditional Chinese"), new("1", "English"),
+                new("2", "Japanese"), new("3", "Korean"), new("6", "German"), new("7", "Spanish"),
+                new("8", "Portuguese"), new("10", "French"), new("12", "Thai")
+            ]),
+            Choice("VoiceLanguage", "Voice-over language", [new("0", "Mandarin"), new("1", "English"), new("2", "Japanese"), new("3", "Korean")])
+        ], "Voice-over languages require the corresponding voice pack to be installed.")
     ];
 
     private readonly string _gameUserSettingsPath;
@@ -287,7 +292,7 @@ internal sealed class WuwaGameSettings
     }
 
     private static IReadOnlyList<GameSettingChoice> AddUnknownChoice(IReadOnlyList<GameSettingChoice> choices, string value) =>
-        choices.Any(choice => choice.Value == value) ? choices : [.. choices, new(value, $"Unknown ({value})")];
+        choices.Any(choice => choice.Value == value) ? choices : [.. choices, new(value, $"Unverified value ({value})")];
 
     private static LocalSetting FindLocalSetting(string key) =>
         LocalSettingSections.SelectMany(section => section.Settings).FirstOrDefault(setting => setting.Key == key)
@@ -299,9 +304,6 @@ internal sealed class WuwaGameSettings
     private static LocalSetting Slider(string key, string title, double minimum, double maximum, double step = 1,
                                        string? description = null) =>
         new(key, title, LocalSettingKind.Number, minimum, maximum, step, null, description);
-
-    private static LocalSetting Level(string key, string title, int maximum, string? description = null) =>
-        Choice(key, title, [.. Enumerable.Range(0, maximum + 1).Select(level => new GameSettingChoice(level.ToString(CultureInfo.InvariantCulture), $"Level {level}"))], description);
 
     private static LocalSetting Choice(string key, string title, IReadOnlyList<GameSettingChoice> choices,
                                        string? description = null) =>
