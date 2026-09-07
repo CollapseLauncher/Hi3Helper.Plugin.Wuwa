@@ -3,7 +3,8 @@ using System.IO;
 using System.Threading;
 using Hi3Helper.Plugin.Core;
 using Microsoft.Extensions.Logging;
-using SharpHDiffPatch.Core;
+using SharpHPatchZ;
+using SharpHPatchZ.Header;
 
 // ReSharper disable InconsistentNaming
 // ReSharper disable IdentifierTypo
@@ -11,7 +12,7 @@ using SharpHDiffPatch.Core;
 namespace Hi3Helper.Plugin.Wuwa.Utils;
 
 /// <summary>
-/// Wrapper around SharpHDiffPatch.Core for applying KRPDiff patches
+/// Wrapper around SharpHPatchZ for applying KRPDiff patches
 /// (HDiff19 + ZSTD + Fadler64).
 /// </summary>
 internal static class HPatchZNative
@@ -24,7 +25,15 @@ internal static class HPatchZNative
     {
         try
         {
-            return HDiffPatch.GetHDiffOldSize(diffFilePath);
+            HDiffInfo info = HPatch.CreateInstance(diffFilePath, new InitializeOptions { IsKuroGamesHDiff = true });
+            try
+            {
+                return HPatch.TryGetPatchMetadata(ref info, out var metadata) ? metadata.DiffOldSize : -1;
+            }
+            finally
+            {
+                info.Dispose();
+            }
         }
         catch
         {
@@ -32,26 +41,9 @@ internal static class HPatchZNative
         }
     }
 
-    private readonly struct DirPatchMode(bool buffered, bool fullBuffer, bool fastBuffer)
-    {
-        internal bool Buffered { get; } = buffered;
-        internal bool FullBuffer { get; } = fullBuffer;
-        internal bool FastBuffer { get; } = fastBuffer;
-    }
-
-    private static readonly DirPatchMode[] DirPatchModes =
-    [
-        // Library default recommendation (README): buffered + fastBuffer, no fullBuffer.
-        new(buffered: true,  fullBuffer: false, fastBuffer: true),
-        new(buffered: true,  fullBuffer: false, fastBuffer: false),
-        new(buffered: false, fullBuffer: false, fastBuffer: false),
-        // Last resort for small diffs only — fullBuffer can blow up on multi-GB paks.
-        new(buffered: true,  fullBuffer: true,  fastBuffer: false),
-    ];
-
     /// <summary>
-    /// SharpHDiffPatch throws this when on-disk source bytes do not match what the krpdiff
-    /// was built from (wrong size/version/corruption). Retrying buffer modes cannot fix it.
+    /// Detects errors indicating on-disk source bytes do not match what the krpdiff
+    /// was built from (wrong size/version/corruption). The installer uses this to fall back to downloading full files.
     /// </summary>
     internal static bool IsLikelySourceDataMismatch(Exception ex)
     {
@@ -74,6 +66,11 @@ internal static class HPatchZNative
             if (cur.Message.Contains("out of bounds", StringComparison.OrdinalIgnoreCase))
                 return true;
 
+            if (cur is InvalidOperationException &&
+                (cur.Message.Contains("input file size does not match", StringComparison.OrdinalIgnoreCase) ||
+                 cur.Message.Contains("input file size mismatched", StringComparison.OrdinalIgnoreCase)))
+                return true;
+
             // PatchDir throws InvalidDataException when combined source stream size
             // doesn't match the krpdiff's expected oldDataSize. This is deterministic
             // and retrying buffer modes cannot fix it.
@@ -88,7 +85,7 @@ internal static class HPatchZNative
 
     /// <summary>
     /// Apply a KRPDiff patch file to a source file, producing a new output file.
-    /// Uses SharpHDiffPatch.Core (managed C# HDiff implementation).
+    /// Uses SharpHPatchZ (managed C# HDiff implementation).
     /// </summary>
     /// <param name="sourceFilePath">Path to the original file to be patched.</param>
     /// <param name="diffFilePath">Path to the .krpdiff file.</param>
@@ -115,10 +112,12 @@ internal static class HPatchZNative
 
         try
         {
-            var patcher = new HDiffPatch();
-            patcher.Initialize(diffFilePath);
-            patcher.Patch(sourceFilePath, outputFilePath, useBufferedPatch: true, token: token,
-                useFullBuffer: false, useFastBuffer: true);
+            token.ThrowIfCancellationRequested();
+            using HDiffInfo info = HPatch.CreateInstance(diffFilePath);
+            PatchResult result = HPatch.Patch(info, diffFilePath, sourceFilePath, outputFilePath,
+                options: PatchOptions.Default, token: token);
+            if (!result)
+                throw result.Exception ?? new InvalidOperationException("Patch failed without an exception.");
         }
         catch (OperationCanceledException)
         {
@@ -154,7 +153,7 @@ internal static class HPatchZNative
     /// <summary>
     /// Apply a KRPDiff directory-level patch: the diff was built from a set of source files
     /// under <paramref name="sourceDir"/> and produces a set of output files under
-    /// <paramref name="outputDir"/>. SharpHDiffPatch.Core auto-detects directory mode from
+    /// <paramref name="outputDir"/>. SharpHPatchZ auto-detects directory mode from
     /// the diff header and resolves internal file references relative to the supplied paths.
     /// </summary>
     /// <param name="sourceDir">Root directory containing the original (old) files.</param>
@@ -180,95 +179,44 @@ internal static class HPatchZNative
             "[HPatchZNative::ApplyDirPatch] Applying dir patch: srcDir={Source}, diff={Diff}, outDir={Output}",
             sourceDir, diffFilePath, outputDir);
 
-        Exception? lastEx = null;
-        foreach (DirPatchMode mode in DirPatchModes)
+        try
         {
             token.ThrowIfCancellationRequested();
-
-            try
-            {
-                if (Directory.Exists(outputDir))
-                {
-                    try { Directory.Delete(outputDir, true); }
-                    catch { /* best-effort */ }
-                }
-
-                Directory.CreateDirectory(outputDir);
-
-                var patcher = new HDiffPatch();
-                patcher.Initialize(diffFilePath);
-                patcher.DirPatchFormat = DirectoryPatchFormat.Kuro;
-                RunDirPatch(patcher, sourceDir, outputDir, mode, writeBytesDelegate, token);
-
-                SharedStatic.InstanceLogger.LogDebug(
-                    "[HPatchZNative::ApplyDirPatch] Dir patch applied successfully with buffered={Buffered}, " +
-                    "fullBuffer={FullBuffer}, fastBuffer={FastBuffer}: {Output}",
-                    mode.Buffered, mode.FullBuffer, mode.FastBuffer, outputDir);
-                return;
-            }
-            catch (OperationCanceledException)
-            {
-                try { if (Directory.Exists(outputDir)) Directory.Delete(outputDir, true); }
-                catch { /* ignore cleanup errors */ }
-                throw;
-            }
-            catch (Exception ex) when (FindCancellation(ex) is { } oce)
-            {
-                try { if (Directory.Exists(outputDir)) Directory.Delete(outputDir, true); }
-                catch { /* ignore cleanup errors */ }
-                throw oce;
-            }
-            catch (Exception ex)
-            {
-                lastEx = ex;
-                SharedStatic.InstanceLogger.LogWarning(
-                    "[HPatchZNative::ApplyDirPatch] Attempt failed (buffered={Buffered}, fullBuffer={FullBuffer}, " +
-                    "fastBuffer={FastBuffer}) for {Source}: {Error}",
-                    mode.Buffered, mode.FullBuffer, mode.FastBuffer, sourceDir, FormatExceptionChain(ex));
-
-                try
-                {
-                    if (Directory.Exists(outputDir))
-                        Directory.Delete(outputDir, true);
-                }
-                catch { /* ignore cleanup errors */ }
-
-                if (IsLikelySourceDataMismatch(ex))
-                {
-                    SharedStatic.InstanceLogger.LogInformation(
-                        "[HPatchZNative::ApplyDirPatch] Source bytes do not match krpdiff metadata for {Source}; " +
-                        "skipping remaining buffer modes.",
-                        sourceDir);
-                    break;
-                }
-            }
+            using HDiffInfo info = HPatch.CreateInstance(diffFilePath,
+                new InitializeOptions { IsKuroGamesHDiff = true });
+            PatchResult result = HPatch.Patch(info, diffFilePath, sourceDir, outputDir, options: PatchOptions.Default,
+                progressCallback: writeBytesDelegate == null ? null : (_, _, written) => writeBytesDelegate(written),
+                token: token);
+            if (!result)
+                throw result.Exception ?? new InvalidOperationException("Directory patch failed without an exception.");
         }
-
-        SharedStatic.InstanceLogger.LogError(
-            "[HPatchZNative::ApplyDirPatch] Dir patch failed for {Source} after all retry modes",
-            sourceDir);
-
-        throw new InvalidOperationException(
-            $"HDiff dir patch application failed for sourceDir: {sourceDir}, diff: {diffFilePath}", lastEx);
-    }
-
-    private static void RunDirPatch(
-        HDiffPatch patcher,
-        string sourceDir,
-        string outputDir,
-        DirPatchMode mode,
-        Action<long>? writeBytesDelegate,
-        CancellationToken token)
-    {
-        if (writeBytesDelegate != null)
+        catch (OperationCanceledException)
         {
-            patcher.Patch(sourceDir, outputDir, useBufferedPatch: mode.Buffered, writeBytesDelegate,
-                token: token, useFullBuffer: mode.FullBuffer, useFastBuffer: mode.FastBuffer);
-            return;
+            try { if (Directory.Exists(outputDir)) Directory.Delete(outputDir, true); }
+            catch { /* ignore cleanup errors */ }
+            throw;
+        }
+        catch (Exception ex) when (FindCancellation(ex) is { } oce)
+        {
+            try { if (Directory.Exists(outputDir)) Directory.Delete(outputDir, true); }
+            catch { /* ignore cleanup errors */ }
+            throw oce;
+        }
+        catch (Exception ex)
+        {
+            SharedStatic.InstanceLogger.LogError(
+                "[HPatchZNative::ApplyDirPatch] Dir patch failed for {Source}: {Error}",
+                sourceDir, FormatExceptionChain(ex));
+
+            try { if (Directory.Exists(outputDir)) Directory.Delete(outputDir, true); }
+            catch { /* ignore cleanup errors */ }
+
+            throw new InvalidOperationException(
+                $"HDiff dir patch application failed for sourceDir: {sourceDir}, diff: {diffFilePath}", ex);
         }
 
-        patcher.Patch(sourceDir, outputDir, useBufferedPatch: mode.Buffered, token: token,
-            useFullBuffer: mode.FullBuffer, useFastBuffer: mode.FastBuffer);
+        SharedStatic.InstanceLogger.LogDebug(
+            "[HPatchZNative::ApplyDirPatch] Dir patch applied successfully: {Output}", outputDir);
     }
 
     /// <summary>
