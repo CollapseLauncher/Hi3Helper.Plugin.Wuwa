@@ -1278,29 +1278,51 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             var installFi = new FileInfo(installFilePath);
                             if (installFi.Length == (long)entry.Size)
                             {
+                                bool matches = true;
                                 // Also verify MD5 to catch stale files with matching size.
                                 if (!string.IsNullOrEmpty(entry.Md5) && installFi.Length <= Md5CheckSizeThreshold)
                                 {
                                     await using var installFs = File.OpenRead(installFilePath);
                                     string installMd5 = await WuwaUtils.ComputeMd5HexAsync(installFs, token)
                                         .ConfigureAwait(false);
-                                    if (!string.Equals(installMd5, entry.Md5, StringComparison.OrdinalIgnoreCase))
-                                    {
-                                        throw new InvalidOperationException(
-                                            $"Full-replacement file was skipped during download but MD5 does not match in install dir: {entry.Dest} (expected={entry.Md5}, computed={installMd5})");
-                                    }
+                                    matches = string.Equals(installMd5, entry.Md5, StringComparison.OrdinalIgnoreCase);
                                 }
 
-                                SharedStatic.InstanceLogger.LogDebug(
-                                    "[Patch::RunAsync] Verification: full-replacement file verified in install dir (skipped download): {Dest}",
-                                    entry.Dest);
-                                verifiedDownloadCount++;
-                                installProgress.StateCount = verifiedDownloadCount;
-                                installProgress.DownloadedCount = verifiedDownloadCount;
-                                ReportProgress();
-                                continue;
+                                if (matches)
+                                {
+                                    SharedStatic.InstanceLogger.LogDebug(
+                                        "[Patch::RunAsync] Verification: full-replacement file verified in install dir (skipped download): {Dest}",
+                                        entry.Dest);
+                                    verifiedDownloadCount++;
+                                    installProgress.StateCount = verifiedDownloadCount;
+                                    installProgress.DownloadedCount = verifiedDownloadCount;
+                                    ReportProgress();
+                                    continue;
+                                }
                             }
                         }
+
+                        SharedStatic.InstanceLogger.LogWarning(
+                            "[Patch::RunAsync] Full-replacement file missing or invalid in install dir; downloading: {Dest}",
+                            entry.Dest);
+                        WuwaApiResponseGameConfigRef? targetConfigRef = kind == GameInstallerKind.Preload
+                            ? manager.ApiPredownloadReference
+                            : manager.ApiConfigReference;
+                        string cdnHost = (_owner.ApiResponseAssetUrl ?? "").TrimEnd('/');
+                        string relativeBase = (targetConfigRef?.BaseUrl ?? _owner.GameResourceBasisPath ?? "").TrimEnd('/');
+                        string baseUrl = string.IsNullOrEmpty(cdnHost)
+                            ? relativeBase
+                            : $"{cdnHost}/{relativeBase.TrimStart('/')}";
+                        Uri uri = new($"{baseUrl}/{entry.Dest}", UriKind.Absolute);
+                        Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+                        // This entry was already credited during download. Verify the recovered
+                        // temp file below without adding its bytes or file count a second time.
+                        if (entry.ChunkInfos is { Length: > 0 })
+                            await _owner.TryDownloadChunkedFileWithFallbacksAsync(
+                                uri, filePath, entry.ChunkInfos, entry.Dest, token, null).ConfigureAwait(false);
+                        else
+                            await _owner.TryDownloadWholeFileWithFallbacksAsync(
+                                uri, filePath, entry.Dest, token, null).ConfigureAwait(false);
                     }
 
                     if (!File.Exists(filePath))

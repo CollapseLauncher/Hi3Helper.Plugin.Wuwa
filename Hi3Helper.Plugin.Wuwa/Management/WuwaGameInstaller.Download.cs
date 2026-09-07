@@ -17,14 +17,25 @@ namespace Hi3Helper.Plugin.Wuwa.Management
     {
         internal async Task TryDownloadWholeFileWithFallbacksAsync(Uri originalUri, string outputPath, string rawDest, CancellationToken token, Action<long>? progressCallback)
         {
+            long attemptBytes = 0;
+            void ReportAttempt(long bytes)
+            {
+                attemptBytes += bytes;
+                progressCallback?.Invoke(bytes);
+            }
+
             // Try original first
             try
             {
-                await DownloadWholeFileAsync(originalUri, outputPath, token, progressCallback).ConfigureAwait(false);
+                await DownloadWholeFileAsync(originalUri, outputPath, token, ReportAttempt).ConfigureAwait(false);
                 return;
             }
             catch (Exception ex) when (ex is HttpRequestException or IOException)
             {
+                // The fallback reports the entire resumed prefix again, including bytes
+                // credited before this attempt. Undo only this file's contribution.
+                if (attemptBytes != 0)
+                    progressCallback?.Invoke(-attemptBytes);
                 SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::TryDownloadWholeFileWithFallbacksAsync] Primary download failed: {Uri}. Reason: {Msg}", originalUri, ex.Message);
             }
 
@@ -47,14 +58,24 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
         internal async Task TryDownloadChunkedFileWithFallbacksAsync(Uri originalUri, string outputPath, WuwaApiResponseResourceChunkInfo[] chunkInfos, string rawDest, CancellationToken token, Action<long>? progressCallback)
         {
+            long attemptBytes = 0;
+            void ReportAttempt(long bytes)
+            {
+                attemptBytes += bytes;
+                progressCallback?.Invoke(bytes);
+            }
+
             // Try original first
             try
             {
-                await DownloadChunkedFileAsync(originalUri, outputPath, chunkInfos, token, progressCallback).ConfigureAwait(false);
+                await DownloadChunkedFileAsync(originalUri, outputPath, chunkInfos, token, ReportAttempt).ConfigureAwait(false);
                 return;
             }
             catch (Exception ex) when (ex is HttpRequestException or IOException)
             {
+                // Completed chunks and a partial chunk are credited again on resume.
+                if (attemptBytes != 0)
+                    progressCallback?.Invoke(-attemptBytes);
                 SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::TryDownloadChunkedFileWithFallbacksAsync] Primary chunked download failed: {Uri}. Reason: {Msg}", originalUri, ex.Message);
             }
 
