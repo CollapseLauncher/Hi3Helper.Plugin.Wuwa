@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Hi3Helper.Plugin.Core/Hi3Helper.Plugin.Core.csproj" />
+    <Compile Include="../../Hi3Helper.Plugin.Wuwa/Management/WuwaGameInstaller.Download.cs" Link="WuwaGameInstaller.Download.cs" />
+    <Compile Include="../../Hi3Helper.Plugin.Wuwa/Management/Api/WuwaApiResponseResourceIndex.cs" Link="WuwaApiResponseResourceIndex.cs" />
+  </ItemGroup>
+</Project>
