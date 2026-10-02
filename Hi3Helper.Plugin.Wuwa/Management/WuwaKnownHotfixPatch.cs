@@ -39,13 +39,16 @@ internal sealed class WuwaKnownHotfixPatch
 
     internal WuwaKnownHotfixPatch(
         string packageVersion,
-        IReadOnlyList<WuwaHotfixComponent> components)
+        IReadOnlyList<WuwaHotfixComponent> components,
+        string? resourcePackageVersion = null)
     {
         PackageVersion = packageVersion;
+        ResourcePackageVersion = resourcePackageVersion ?? packageVersion;
         Components = components;
     }
 
     internal string PackageVersion { get; }
+    internal string ResourcePackageVersion { get; }
     internal IReadOnlyList<WuwaHotfixComponent> Components { get; }
     internal IEnumerable<WuwaHotfixPatchFile> Files => Components.SelectMany(x => x.Files);
     internal IEnumerable<WuwaHotfixPatchFile> Manifests => Components.Select(x => x.Manifest);
@@ -60,10 +63,14 @@ internal sealed class WuwaKnownHotfixPatch
         HttpClient client,
         CancellationToken token)
     {
+        string? resourcePackageVersion = FindResourcePackageVersion(gamePath, packageVersion);
+        if (resourcePackageVersion == null)
+            return null;
+
         var components = new List<WuwaHotfixComponent>(2);
         foreach (string resourceType in new[] { "Launcher", "Resource" })
         {
-            string? sourceVersion = FindMountedSourceVersion(gamePath, packageVersion, resourceType);
+            string? sourceVersion = FindMountedSourceVersion(gamePath, resourcePackageVersion, resourceType);
             if (sourceVersion == null)
                 continue;
 
@@ -75,11 +82,11 @@ internal sealed class WuwaKnownHotfixPatch
 
         return components.Count == 0
             ? null
-            : new WuwaKnownHotfixPatch(packageVersion, components);
+            : new WuwaKnownHotfixPatch(packageVersion, components, resourcePackageVersion);
     }
 
     internal string GetPackageRoot(string gamePath) =>
-        Path.Combine(gamePath, SavedResourcesPath.Replace('/', Path.DirectorySeparatorChar), PackageVersion);
+        Path.Combine(gamePath, SavedResourcesPath.Replace('/', Path.DirectorySeparatorChar), ResourcePackageVersion);
 
     internal string GetResourceVersionPath(string gamePath, string resourceType, string version) =>
         Path.Combine(GetPackageRoot(gamePath), resourceType, version);
@@ -148,33 +155,23 @@ internal sealed class WuwaKnownHotfixPatch
 
         string baseUrl = $"{WindowsCdnRoot}/{targetVersion}";
         var files = new List<WuwaHotfixPatchFile>();
-        if (resourceType == "Launcher")
+        for (int group = 0; group < 256; group++)
         {
-            string name = $"ManifestLauncher_ls_{sourceVersion}_{targetVersion}.hp";
+            string name = $"Manifest{resourceType}_g{group}_{sourceVersion}_{targetVersion}.hp";
             WuwaHotfixPatchFile? file = await CreateFileAsync(
                 client, baseUrl, resourceType, name, token).ConfigureAwait(false);
             if (file == null)
-                return null;
+                break;
             files.Add(file);
+            if (group == 255)
+                throw new InvalidDataException("Hotfix group discovery exceeded its limit.");
         }
-        else
-        {
-            for (int group = 0; group < 256; group++)
-            {
-                string name = $"ManifestResource_g{group}_{sourceVersion}_{targetVersion}.hp";
-                WuwaHotfixPatchFile? file = await CreateFileAsync(
-                    client, baseUrl, resourceType, name, token).ConfigureAwait(false);
-                if (file == null)
-                    break;
-                files.Add(file);
-            }
 
-            string lastSegmentName = $"ManifestResource_ls_{sourceVersion}_{targetVersion}.hp";
-            WuwaHotfixPatchFile? lastSegment = await CreateFileAsync(
-                client, baseUrl, resourceType, lastSegmentName, token).ConfigureAwait(false);
-            if (lastSegment != null)
-                files.Add(lastSegment);
-        }
+        string lastSegmentName = $"Manifest{resourceType}_ls_{sourceVersion}_{targetVersion}.hp";
+        WuwaHotfixPatchFile? lastSegment = await CreateFileAsync(
+            client, baseUrl, resourceType, lastSegmentName, token).ConfigureAwait(false);
+        if (lastSegment != null)
+            files.Add(lastSegment);
 
         if (files.Count == 0)
             return null;
@@ -191,6 +188,30 @@ internal sealed class WuwaKnownHotfixPatch
             ? null
             : new WuwaHotfixComponent(
                 resourceType, sourceVersion, targetVersion, baseUrl, files, manifest);
+    }
+
+    internal static string? FindResourcePackageVersion(string gamePath, string packageVersion)
+    {
+        if (!Version.TryParse(packageVersion, out Version? package))
+            return null;
+
+        string root = Path.Combine(gamePath, SavedResourcesPath.Replace('/', Path.DirectorySeparatorChar));
+        if (!Directory.Exists(root))
+            return null;
+
+        // Maintenance package releases can retain the previous internal resource package.
+        // Only accept an unambiguous mounted package from this major/minor release.
+        string[] candidates = Directory.EnumerateDirectories(root)
+            .Select(Path.GetFileName)
+            .Where(name => Version.TryParse(name, out Version? version) &&
+                version.Major == package.Major && version.Minor == package.Minor && version <= package)
+            .Where(name => FindMountedSourceVersion(gamePath, name!, "Launcher") != null ||
+                FindMountedSourceVersion(gamePath, name!, "Resource") != null)
+            .Select(name => name!)
+            .ToArray();
+        if (candidates.Length > 1)
+            throw new InvalidDataException("Multiple mounted resource packages exist; cannot select the active hotfix source.");
+        return candidates.SingleOrDefault();
     }
 
     private static string? FindMountedSourceVersion(
@@ -253,15 +274,16 @@ internal sealed class WuwaKnownHotfixPatch
         using var request = new HttpRequestMessage(HttpMethod.Head, url);
         using HttpResponseMessage response = await client.SendAsync(
             request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
-        if (response.StatusCode == HttpStatusCode.NotFound || !response.IsSuccessStatusCode)
+        if (response.StatusCode == HttpStatusCode.NotFound)
             return null;
+        response.EnsureSuccessStatusCode();
 
         long? size = response.Content.Headers.ContentLength;
         string? md5 = response.Headers.TryGetValues("X-Cos-Meta-Md5", out var values)
             ? values.FirstOrDefault()
             : response.Headers.ETag?.Tag.Trim('"');
         if (size is not > 0 || md5 == null || md5.Length != 32 || !md5.All(Uri.IsHexDigit))
-            return null;
+            throw new InvalidDataException($"Invalid hotfix metadata: {url}");
 
         return (size.Value, md5);
     }

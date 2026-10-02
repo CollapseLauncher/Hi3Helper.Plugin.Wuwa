@@ -274,11 +274,7 @@ internal partial class WuwaGameInstaller
                 launcher?.TargetVersion,
                 resource?.TargetVersion,
                 launcher == null ? null : mounts["Launcher"]);
-            foreach (WuwaHotfixComponent component in patch.Components)
-            {
-                TryDeleteOldHotfixSource(patch.GetResourceVersionPath(
-                    gamePath, component.ResourceType, component.SourceVersion));
-            }
+            // Retain sources until the game reconciles the new mounts and version records.
 
             progress.StateCount = progress.TotalStateToComplete;
             ReportProgress();
@@ -448,21 +444,6 @@ internal partial class WuwaGameInstaller
         }
 
         AtomicWrite(path, content);
-    }
-
-    private static void TryDeleteOldHotfixSource(string path)
-    {
-        try
-        {
-            if (Directory.Exists(path))
-                Directory.Delete(path, true);
-        }
-        catch (Exception ex)
-        {
-            SharedStatic.InstanceLogger.LogWarning(
-                "[WuwaGameInstaller::Hotfix] Could not remove old overlay {Path}: {Error}",
-                path, ex.Message);
-        }
     }
 
     private static string GetHotfixDownloadRoot(string gamePath, WuwaKnownHotfixPatch patch) =>
