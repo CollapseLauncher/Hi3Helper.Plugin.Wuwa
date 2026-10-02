@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using Hi3Helper.Plugin.Core;
@@ -114,7 +115,7 @@ internal static class HPatchZNative
         {
             token.ThrowIfCancellationRequested();
             using HDiffInfo info = HPatch.CreateInstance(diffFilePath);
-            PatchResult result = HPatch.Patch(info, diffFilePath, sourceFilePath, outputFilePath,
+            PatchResult result = HPatch.Patch(info, CreateSectionStreams(info, diffFilePath), sourceFilePath, outputFilePath,
                 options: PatchOptions.Default, token: token);
             if (!result)
                 throw result.Exception ?? new InvalidOperationException("Patch failed without an exception.");
@@ -184,7 +185,7 @@ internal static class HPatchZNative
             token.ThrowIfCancellationRequested();
             using HDiffInfo info = HPatch.CreateInstance(diffFilePath,
                 new InitializeOptions { IsKuroGamesHDiff = true });
-            PatchResult result = HPatch.Patch(info, diffFilePath, sourceDir, outputDir, options: PatchOptions.Default,
+            PatchResult result = HPatch.Patch(info, CreateSectionStreams(info, diffFilePath), sourceDir, outputDir, options: PatchOptions.Default,
                 progressCallback: writeBytesDelegate == null ? null : (_, _, written) => writeBytesDelegate(written),
                 token: token);
             if (!result)
@@ -217,6 +218,76 @@ internal static class HPatchZNative
 
         SharedStatic.InstanceLogger.LogDebug(
             "[HPatchZNative::ApplyDirPatch] Dir patch applied successfully: {Output}", outputDir);
+    }
+
+    // SharpHPatchZ 3.1.0 does not bound its section decompression streams. In
+    // particular, Zstd prefetch can consume the raw RLE section following a valid
+    // compressed cover section and fail with "Unknown frame descriptor".
+    private static unsafe CreateStream CreateSectionStreams(HDiffInfo info, string diffFilePath)
+    {
+        if (!HPatch.TryGetPatchMetadata(ref info, out var metadata))
+            throw new InvalidDataException("Patch section metadata is unavailable.");
+
+        var lengths = new Dictionary<long, long>();
+        long offset = metadata.DiffDataOffset;
+        foreach (var section in new[]
+                 {
+                     *metadata.CoverDataSizeP, *metadata.RleControlDataSizeP,
+                     *metadata.RleCodeDataSizeP, *metadata.NewDiffDataSizeP
+                 })
+        {
+            long length = section.CompressedSize > 0 ? section.CompressedSize : section.Size;
+            // Empty sections share the next section's offset and consume no data.
+            lengths[offset] = length;
+            offset = checked(offset + length);
+        }
+
+        return position => (new PatchSectionStream(diffFilePath, position, lengths[position]), false);
+    }
+
+    // HPatch.Patch uses synchronous reads; each reader owns an independent handle.
+    private sealed class PatchSectionStream : Stream
+    {
+        private readonly FileStream _file;
+        private readonly long _end;
+
+        internal PatchSectionStream(string path, long offset, long length)
+        {
+            _end = checked(offset + length);
+            _file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            _file.Position = offset;
+        }
+
+        public override int Read(Span<byte> buffer)
+            => _file.Read(buffer[..(int)Math.Min(buffer.Length, Math.Max(0, _end - _file.Position))]);
+
+        public override int Read(byte[] buffer, int offset, int count)
+            => Read(buffer.AsSpan(offset, count));
+
+        public override int ReadByte()
+            => _file.Position < _end ? _file.ReadByte() : -1;
+
+        public override bool CanRead => _file.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                _file.Dispose();
+            base.Dispose(disposing);
+        }
     }
 
     /// <summary>

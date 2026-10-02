@@ -1547,6 +1547,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         fileUrl, expectedSize, chunkInfos is { Length: > 0 });
 
                     long replacementAccum = 0;
+                    string stagedReplacement = finalDst + ".replacement";
                     long replacementTotal = (long)expectedSize;
 
                     Action<long> progressCallback = bytes =>
@@ -1562,31 +1563,18 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     if (chunkInfos is { Length: > 0 })
                     {
                         await _owner.TryDownloadChunkedFileWithFallbacksAsync(
-                            uri, finalDst, chunkInfos, dstRef.Dest, token, progressCallback)
+                            uri, stagedReplacement, chunkInfos, dstRef.Dest, token, progressCallback)
                             .ConfigureAwait(false);
                     }
                     else
                     {
                         await _owner.TryDownloadWholeFileWithFallbacksAsync(
-                            uri, finalDst, dstRef.Dest, token, progressCallback)
+                            uri, stagedReplacement, dstRef.Dest, token, progressCallback)
                             .ConfigureAwait(false);
                     }
 
-                    if (!string.IsNullOrEmpty(expectedMd5))
-                    {
-                        await using var dlStream = File.OpenRead(finalDst);
-                        string dlMd5 = await WuwaUtils
-                            .ComputeMd5HexAsync(dlStream, token)
-                            .ConfigureAwait(false);
-                        var dlFi = new FileInfo(finalDst);
-                        if (!string.Equals(dlMd5, expectedMd5, StringComparison.OrdinalIgnoreCase))
-                        {
-                            throw new InvalidOperationException(
-                                $"Downloaded replacement file MD5 mismatch for {dstRef.Dest}: " +
-                                $"expected={expectedMd5}, computed={dlMd5}, url={fileUrl}, " +
-                                $"size={dlFi.Length}, patchMd5={dstRef.Md5}, resourceMd5={resourceEntry?.Md5}");
-                        }
-                    }
+                    await WuwaFileIntegrity.CommitAsync(stagedReplacement, finalDst,
+                        expectedSize, expectedMd5, token).ConfigureAwait(false);
 
                     if (updateGlobalProgress)
                     {
@@ -2288,9 +2276,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             if (!string.IsNullOrEmpty(destDir2))
                                 Directory.CreateDirectory(destDir2);
 
-                            if (File.Exists(finalDst))
-                                File.Delete(finalDst);
-                            File.Move(patchedFile, finalDst);
+                            File.Move(patchedFile, finalDst, overwrite: true);
 
                             // StateCount was already incremented during patch operation,
                             // so just update DownloadedCount here
@@ -2424,9 +2410,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         if (!string.IsNullOrEmpty(destDir))
                             Directory.CreateDirectory(destDir);
 
-                        if (File.Exists(destInInstall))
-                            File.Delete(destInInstall);
-                        File.Move(srcInTemp, destInInstall);
+                        File.Move(srcInTemp, destInInstall, overwrite: true);
                     }
                 }
 
