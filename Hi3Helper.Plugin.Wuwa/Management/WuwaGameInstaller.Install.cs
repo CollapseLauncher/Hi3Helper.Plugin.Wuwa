@@ -540,6 +540,12 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 #endregion
 
                 #region Install / Extraction Phase (move temp -> final)
+                // Do not commit any files or version metadata while required downloads
+                // are missing or still invalid, including failures whose cleanup failed.
+                foreach (var kv in downloadList)
+                    await WuwaFileIntegrity.VerifyAsync(Path.Combine(tempPath, kv.Key),
+                        kv.Value.Size, kv.Value.Md5, token).ConfigureAwait(false);
+
                 SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallCoreAsync] Starting install/extract phase.");
                 Volatile.Write(ref installProgress.StateCount, 0);
                 Volatile.Write(ref installProgress.DownloadedCount, 0);
@@ -556,22 +562,9 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     if (!string.IsNullOrEmpty(parentDir))
                         Directory.CreateDirectory(parentDir);
 
-                    try
-                    {
-                        if (File.Exists(tempFile))
-                        {
-                            // Overwrite final file
-                            if (File.Exists(finalFile))
-                                File.Delete(finalFile);
-                            File.Move(tempFile, finalFile);
-                            var fi = new FileInfo(finalFile);
-                            Interlocked.Add(ref installProgress.DownloadedBytes, fi.Length);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallCoreAsync] Failed moving file {Temp} -> {Final}: {Err}", tempFile, finalFile, ex.Message);
-                    }
+                    File.Move(tempFile, finalFile, overwrite: true);
+                    var fi = new FileInfo(finalFile);
+                    Interlocked.Add(ref installProgress.DownloadedBytes, fi.Length);
 
                     Interlocked.Increment(ref installProgress.StateCount);
                     Interlocked.Increment(ref installProgress.DownloadedCount);
