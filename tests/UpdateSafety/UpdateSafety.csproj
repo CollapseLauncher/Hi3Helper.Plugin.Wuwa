@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../Hi3Helper.Plugin.Core/Hi3Helper.Plugin.Core.csproj" />
+    <Compile Include="../../Hi3Helper.Plugin.Wuwa/Management/WuwaKnownHotfixPatch.cs" Link="WuwaKnownHotfixPatch.cs" />
+    <Compile Include="../../Hi3Helper.Plugin.Wuwa/Management/WuwaFileIntegrity.cs" Link="WuwaFileIntegrity.cs" />
+    <Compile Include="../../Hi3Helper.Plugin.Wuwa/Utils/WuwaUtils.cs" Link="WuwaUtils.cs" />
+    <Compile Include="../../Hi3Helper.Plugin.Wuwa/Utils/WuwaTransform.cs" Link="WuwaTransform.cs" />
+  </ItemGroup>
+</Project>
