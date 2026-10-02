@@ -419,9 +419,9 @@ public partial class Exports
 		SharedStatic.InstanceLogger.LogInformation(
 			"[Wuwa::TryGetStartingProcessFromContext] Starting executable path: {Path}", startingExecutablePath);
 
-		ProcessStartInfo startInfo = string.IsNullOrEmpty(startArgument) ?
-			new ProcessStartInfo(startingExecutablePath) :
-			new ProcessStartInfo(startingExecutablePath, startArgument);
+		startArgument = WuwaLaunchArguments.AddResourceTier(Path.GetDirectoryName(startingExecutablePath)!, startArgument);
+
+		ProcessStartInfo startInfo = new(startingExecutablePath, startArgument);
 
 		process = new Process
 		{
