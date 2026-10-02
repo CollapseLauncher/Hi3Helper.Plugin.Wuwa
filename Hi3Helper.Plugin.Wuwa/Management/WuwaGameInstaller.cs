@@ -189,13 +189,20 @@ internal partial class WuwaGameInstaller : GameInstallerBase
         return StartPatchCoreAsync(GameInstallerKind.Preload, onlyDownload: true, progressDelegate, progressStateDelegate, token);
     }
 
-    protected override Task StartUpdateAsyncInner(InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
+    protected override async Task StartUpdateAsyncInner(InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
     {
         if (TryGetKnownHotfix(out WuwaKnownHotfixPatch hotfix, out string gamePath))
-            return StartKnownHotfixAsync(hotfix, gamePath, progressDelegate, progressStateDelegate, token);
+        {
+            await StartKnownHotfixAsync(hotfix, gamePath, progressDelegate, progressStateDelegate, token).ConfigureAwait(false);
+        }
+        else
+        {
+            await StartPatchCoreAsync(GameInstallerKind.Update, onlyDownload: false, progressDelegate, progressStateDelegate, token).ConfigureAwait(false);
+        }
 
-        // Update: download and apply krpdiff patches (or use pre-downloaded preload files)
-        return StartPatchCoreAsync(GameInstallerKind.Update, onlyDownload: false, progressDelegate, progressStateDelegate, token);
+        // Offer outstanding hotfixes without requiring a launcher restart.
+        if (GameManager is WuwaGameManager manager)
+            await manager.DiscoverHotfixAsync(token).ConfigureAwait(false);
     }
 
     // Delegate installation flow to the Install helper (defined in the separate partial file).
