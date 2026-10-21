@@ -11,7 +11,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -71,12 +70,20 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 // Ensure initialization (loads API/game config)
                 await _owner.InitAsync(token).ConfigureAwait(false);
 
-                // Load index (cached)
-                WuwaApiResponseResourceIndex? index = await _owner.GetCachedIndexAsync(false, token).ConfigureAwait(false);
+                var targetConfig = kind == GameInstallerKind.Preload
+                    ? (_owner.GameManager as WuwaGameManager)?.ApiPredownloadReference : _owner.TargetConfig;
+                string? preloadIndexUrl = kind == GameInstallerKind.Preload && targetConfig != null
+                    ? $"{_owner.ApiResponseAssetUrl?.TrimEnd('/')}/{targetConfig.IndexFile?.TrimStart('/')}" : null;
+                // Full-file preload uses the future target, just like the patch preload.
+                WuwaApiResponseResourceIndex? index = preloadIndexUrl == null
+                    ? await _owner.GetCachedIndexAsync(false, token).ConfigureAwait(false)
+                    : await _owner.FetchResourceIndexAsync(preloadIndexUrl, token).ConfigureAwait(false);
                 if (index?.Resource == null || index.Resource.Length == 0)
                 {
                     SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallCoreAsync] Cached index empty (entries={Count}). Forcing refresh from: {Url}", index?.Resource.Length ?? -1, _owner.GameAssetBaseUrl);
-                    index = await _owner.GetCachedIndexAsync(true, token).ConfigureAwait(false);
+                    index = preloadIndexUrl == null
+                        ? await _owner.GetCachedIndexAsync(true, token).ConfigureAwait(false)
+                        : await _owner.FetchResourceIndexAsync(preloadIndexUrl, token).ConfigureAwait(false);
                     if (index?.Resource == null || index.Resource.Length == 0)
                     {
                         SharedStatic.InstanceLogger.LogError("[WuwaGameInstaller::StartInstallCoreAsync] Resource index is empty even after forced refresh. URL={Url}", _owner.GameAssetBaseUrl);
@@ -148,23 +155,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     bool matches = false;
                     try
                     {
-                        var fi = new FileInfo(finalPath);
-                        // If size present and matches, assume valid (safe fallback when MD5 not available or too large)
-                        if (entry.Size > 0 && fi.Length == (long)entry.Size)
-                        {
-                            matches = true;
-                        }
-
-                        // If MD5 present and file small enough, compute and compare
-                        if (!matches && !string.IsNullOrEmpty(entry.Md5) && fi.Length <= Md5CheckSizeThreshold)
-                        {
-                            await using var fs = File.OpenRead(finalPath);
-                            string md5 = await WuwaUtils.ComputeMd5HexAsync(fs, token);
-                            if (string.Equals(md5, entry.Md5, StringComparison.OrdinalIgnoreCase))
-                            {
-                                matches = true;
-                            }
-                        }
+                        matches = await WuwaFileIntegrity.MatchesAsync(finalPath, entry.Size, entry.Md5, token).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) { throw; }
                     catch (Exception ex)
@@ -203,7 +194,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallCoreAsync] Total bytes to download (sum of filtered index sizes): {TotalBytes}", totalBytesToDownload);
     #endif
                 // Prepare temp folder
-                var tempPath = Path.Combine(installPath, "TempPath", "TempGameFiles");
+                var tempPath = _owner.DownloadCachePath(installPath, false);
                 Directory.CreateDirectory(tempPath);
 
                 // Prepare progress struct with deterministic values
@@ -290,17 +281,21 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     {
                         try
                         {
-                            var fi = new FileInfo(outputPath);
-                            if (entry.Size > 0 && fi.Length == (long)entry.Size)
+                            if (await WuwaFileIntegrity.MatchesAsync(outputPath, entry.Size, entry.Md5, innerToken).ConfigureAwait(false))
                             {
-                                Interlocked.Add(ref installProgress.DownloadedBytes, fi.Length);
+                                Interlocked.Add(ref installProgress.DownloadedBytes, new FileInfo(outputPath).Length);
                                 Interlocked.Increment(ref installProgress.StateCount);
                                 Interlocked.Increment(ref installProgress.DownloadedCount);
                                 ReportProgress(InstallProgressState.Download);
                                 return;
                             }
+                            if (entry.ChunkInfos is { Length: > 0 } && entry.ChunkInfos.All(c => !string.IsNullOrEmpty(c.Md5)))
+                                File.Move(outputPath, outputPath + ".tmp", overwrite: true);
+                            else
+                                File.Delete(outputPath);
                         }
-                        catch { /* ignore, re-download */ }
+                        catch (OperationCanceledException) { throw; }
+                        catch (IOException) { /* re-download */ }
                     }
 
                     // Check for a .tmp from a previous session that is already fully downloaded.
@@ -311,7 +306,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         try
                         {
                             var tmpFi = new FileInfo(pendingTmpPath);
-                            if (tmpFi.Length == (long)entry.Size)
+                            if (tmpFi.Length == (long)entry.Size &&
+                                await WuwaFileIntegrity.MatchesAsync(pendingTmpPath, entry.Size, entry.Md5, innerToken).ConfigureAwait(false))
                             {
                                 // Tmp is already complete — promote it directly
                                 if (File.Exists(outputPath))
@@ -325,11 +321,17 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                 return;
                             }
                         }
-                        catch { /* ignore, fall through to normal download */ }
+                        catch (OperationCanceledException) { throw; }
+                        catch (IOException) { /* fall through to normal download */ }
                     }
 
+                    if (File.Exists(pendingTmpPath) && entry.Size > 0 &&
+                        (ulong)new FileInfo(pendingTmpPath).Length >= entry.Size &&
+                        (entry.ChunkInfos == null || entry.ChunkInfos.Any(c => string.IsNullOrEmpty(c.Md5))))
+                        File.Delete(pendingTmpPath);
+
                     // Build original file URI
-                    Uri fileUri = new(new Uri(new Uri(_owner.ApiResponseAssetUrl!), _owner.GameResourceBasisPath! + "/"), entry.Dest ?? string.Empty);
+                    Uri fileUri = new(_owner.BuildResourceUrl(targetConfig, entry));
 
                     // Per-file progress tracking
                     long perFileAccum = 0;
@@ -460,7 +462,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             if (!string.IsNullOrEmpty(parentDir))
                                 Directory.CreateDirectory(parentDir);
 
-                            Uri fileUri = new(new Uri(new Uri(_owner.ApiResponseAssetUrl!), _owner.GameResourceBasisPath! + "/"), entry.Dest ?? string.Empty);
+                            Uri fileUri = new(_owner.BuildResourceUrl(targetConfig, entry));
                             try
                             {
                                 if (entry.ChunkInfos == null || entry.ChunkInfos.Length == 0)
@@ -546,6 +548,12 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     await WuwaFileIntegrity.VerifyAsync(Path.Combine(tempPath, kv.Key),
                         kv.Value.Size, kv.Value.Md5, token).ConfigureAwait(false);
 
+                if (kind == GameInstallerKind.Preload)
+                {
+                    progressStateDelegate?.Invoke(InstallProgressState.Completed);
+                    return;
+                }
+
                 SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallCoreAsync] Starting install/extract phase.");
                 Volatile.Write(ref installProgress.StateCount, 0);
                 Volatile.Write(ref installProgress.DownloadedCount, 0);
@@ -581,6 +589,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 #endregion
 
                 #region Post-install actions routines
+                if (_owner.GameManager is not WuwaGameManager { IsOperationContext: true })
                 try
                 {
                     _owner.GameManager.GetApiGameVersion(out GameVersion latestVersion);
@@ -594,42 +603,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management
     #if DEBUG
                         SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallCoreAsync] Saved current game version to config.");
     #endif
-                    }
-
-                    // Write app-game-config.json
-                    try
-                    {
-                        string configPath = Path.Combine(installPath, "app-game-config.json");
-    #if DEBUG
-                        SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::StartInstallCoreAsync] Writing app-game-config.json to {Path}", configPath);
-    #endif
-                        using var ms = new MemoryStream();
-                        var writerOptions = new JsonWriterOptions { Indented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
-                        await using (var writer = new Utf8JsonWriter(ms, writerOptions))
-                        {
-                            writer.WriteStartObject();
-                            writer.WriteString("version", latestVersion == GameVersion.Empty ? string.Empty : latestVersion.ToString());
-                            try
-                            {
-                                var idxName = new Uri(_owner.GameAssetBaseUrl ?? string.Empty, UriKind.Absolute).AbsolutePath;
-                                writer.WriteString("indexFile", Path.GetFileName(idxName));
-                                string installType = "unknown";
-                                if (_owner.GameManager is WuwaGameManager gm)
-                                    installType = gm.GetInstallType();
-                                writer.WriteString("InstallType", installType);
-							}
-                            catch { /* ignore */ }
-                            writer.WriteEndObject();
-                            await writer.FlushAsync(token);
-                        }
-
-                        byte[] buffer = ms.ToArray();
-                        await File.WriteAllBytesAsync(configPath, buffer, token).ConfigureAwait(false);
-                        SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallCoreAsync] Wrote app-game-config.json (size={Size})", buffer.Length);
-                    }
-                    catch (Exception ex)
-                    {
-                        SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::StartInstallCoreAsync] Failed to write app-game-config.json: {Err}", ex.Message);
                     }
 
                     // Write LocalGameResources.json so Kuro's launcher recognises the installed files
