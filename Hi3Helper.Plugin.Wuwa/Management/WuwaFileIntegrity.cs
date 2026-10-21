@@ -8,6 +8,16 @@ namespace Hi3Helper.Plugin.Wuwa.Management;
 
 internal static class WuwaFileIntegrity
 {
+    internal static async Task<bool> MatchesAsync(string path, ulong size, string? md5, CancellationToken token)
+    {
+        try
+        {
+            await VerifyAsync(path, size, md5, token).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException) { return false; }
+    }
+
     internal static async Task VerifyAsync(string path, ulong size, string? md5, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();

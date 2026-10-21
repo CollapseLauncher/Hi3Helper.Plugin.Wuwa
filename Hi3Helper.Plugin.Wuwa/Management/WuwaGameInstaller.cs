@@ -24,7 +24,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management;
 [GeneratedComClass]
 internal partial class WuwaGameInstaller : GameInstallerBase
 {
-    private const long   Md5CheckSizeThreshold   = 50L * 1024L * 1024L; // 50 MB
     private const double ExCacheDurationInMinute = 10d;
 
     internal static bool IsBinaryPatchFileName(string path) =>
@@ -61,10 +60,12 @@ internal partial class WuwaGameInstaller : GameInstallerBase
         // Call manager's init logic (internal InitAsyncInner) to populate config and GameResourceBaseUrl.
         int mgrResult = await asWuwaManager.InitAsyncInner(true, token).ConfigureAwait(false);
 
+        if (asWuwaManager.UsesResourcePacks) return mgrResult;
+
         // Attempt to download and cache the resource index (don't fail hard if index is missing; callers handle null).
         try
         {
-            _currentIndex = await GetCachedIndexAsync(true, token).ConfigureAwait(false);
+            _currentIndex = await GetCachedIndexAsync(!asWuwaManager.IsOperationContext, token).ConfigureAwait(false);
             SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::InitAsync] Index cached: {Count} entries", _currentIndex?.Resource.Length ?? 0);
         }
         catch (Exception ex)
@@ -89,15 +90,12 @@ internal partial class WuwaGameInstaller : GameInstallerBase
             "[WuwaGameInstaller::GetGameDownloadedSizeAsyncInner] Called with kind={Kind}, GameAssetBaseUrl={HasUrl}",
             gameInstallerKind, GameAssetBaseUrl != null);
 
-        if (GameAssetBaseUrl is null)
-        {
-            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::GetGameDownloadedSizeAsyncInner] GameAssetBaseUrl is null, returning 0");
-            return 0L;
-        }
-
         // Ensure API/init is ready
         await InitAsync(token).ConfigureAwait(false);
         SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetGameDownloadedSizeAsyncInner] InitAsync completed");
+
+        if (GameManager is WuwaGameManager { UsesResourcePacks: true })
+            return await GetResourcePackSizeAsync(gameInstallerKind, true, token).ConfigureAwait(false);
 
         long result = gameInstallerKind == GameInstallerKind.Update &&
                       TryGetKnownHotfix(out _, out _)
@@ -125,15 +123,12 @@ internal partial class WuwaGameInstaller : GameInstallerBase
             "[WuwaGameInstaller::GetGameSizeAsyncInner] Called with kind={Kind}, GameAssetBaseUrl={HasUrl}",
             gameInstallerKind, GameAssetBaseUrl != null);
 
-        if (GameAssetBaseUrl is null)
-        {
-            SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::GetGameSizeAsyncInner] GameAssetBaseUrl is null, returning 0");
-            return 0L;
-        }
-
         // Ensure API/init is ready
         await InitAsync(token).ConfigureAwait(false);
         SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetGameSizeAsyncInner] InitAsync completed");
+
+        if (GameManager is WuwaGameManager { UsesResourcePacks: true })
+            return await GetResourcePackSizeAsync(gameInstallerKind, false, token).ConfigureAwait(false);
 
         if (gameInstallerKind == GameInstallerKind.Update &&
             TryGetKnownHotfix(out WuwaKnownHotfixPatch hotfix, out _))
@@ -206,10 +201,19 @@ internal partial class WuwaGameInstaller : GameInstallerBase
     }
 
     // Delegate installation flow to the Install helper (defined in the separate partial file).
-    private Task StartInstallCoreAsync(GameInstallerKind kind, InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
+    private async Task StartInstallCoreAsync(GameInstallerKind kind, InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
     {
+        if (GameManager is WuwaGameManager manager && !manager.IsOperationContext)
+        {
+            await InitAsync(token).ConfigureAwait(false);
+            if (manager.UsesResourcePacks)
+            {
+                await RunResourcePacksAsync(kind, progressDelegate, progressStateDelegate, token).ConfigureAwait(false);
+                return;
+            }
+        }
         var installer = new Install(this);
-        return installer.RunAsync(kind, progressDelegate, progressStateDelegate, token);
+        await installer.RunAsync(kind, progressDelegate, progressStateDelegate, token).ConfigureAwait(false);
     }
 
     protected override async Task UninstallAsyncInner(CancellationToken token)
@@ -229,7 +233,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 
     public override void Dispose()
 	{
-		_downloadHttpClient.Dispose();
+		if (_ownsDownloadClient) _downloadHttpClient.Dispose();
 		GC.SuppressFinalize(this);
 	}
 
@@ -247,7 +251,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
                 return Task.FromResult(0L);
             }
 
-            string patchTempPath = Path.Combine(installPath, "TempPath", PatchTempDirName);
+            string patchTempPath = DownloadCachePath(installPath, true);
             SharedStatic.InstanceLogger.LogInformation(
                 "[WuwaGameInstaller::CalculatePatchDownloadedBytesAsync] Checking path: {Path}, Exists={Exists}",
                 patchTempPath, Directory.Exists(patchTempPath));
@@ -333,7 +337,7 @@ internal partial class WuwaGameInstaller : GameInstallerBase
             if (string.IsNullOrEmpty(installPath))
                 return 0L;
 
-            var tempDirPath = Path.Combine(installPath, "TempPath", "TempGameFiles");
+            var tempDirPath = DownloadCachePath(installPath, false);
 
             long total = 0L;
             foreach (var entry in index.Resource)
@@ -434,6 +438,8 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 			SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetCachedIndexAsync] Cached index updated: {Count} entries", _currentIndex?.Resource.Length ?? 0);
 			return _currentIndex;
 		}
+        catch (OperationCanceledException) { throw; }
+        catch (InvalidDataException) { throw; }
 		catch (Exception ex)
 		{
 			SharedStatic.InstanceLogger.LogWarning("[WuwaGameInstaller::GetCachedIndexAsync] Failed to fetch/parse index: {Err}", ex.Message);
@@ -469,11 +475,11 @@ internal partial class WuwaGameInstaller : GameInstallerBase
 			return null;
 		}
 
-		await using var stream = await resp.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+		byte[] manifestBytes = await ReadManifestAsync(resp, url, token).ConfigureAwait(false);
 
 		try
 		{
-			using JsonDocument doc = await JsonDocument.ParseAsync(stream, cancellationToken: token).ConfigureAwait(false);
+			using JsonDocument doc = JsonDocument.Parse(manifestBytes);
 			JsonElement root = doc.RootElement;
 
             if (!TryGetPropertyCI(root, "resource", out JsonElement resourceElem) || resourceElem.ValueKind != JsonValueKind.Array)
