@@ -23,15 +23,24 @@ namespace Hi3Helper.Plugin.Wuwa.Management
         /// <summary>
         /// Entry point for the patch flow, used by both update and preload operations.
         /// </summary>
-        private Task StartPatchCoreAsync(
+        private async Task StartPatchCoreAsync(
             GameInstallerKind kind,
             bool onlyDownload,
             InstallProgressDelegate? progressDelegate,
             InstallProgressStateDelegate? progressStateDelegate,
             CancellationToken token)
         {
+            if (GameManager is WuwaGameManager manager && !manager.IsOperationContext)
+            {
+                await InitAsync(token).ConfigureAwait(false);
+                if (manager.UsesResourcePacks)
+                {
+                    await RunResourcePacksAsync(kind, progressDelegate, progressStateDelegate, token).ConfigureAwait(false);
+                    return;
+                }
+            }
             var patcher = new Patch(this);
-            return patcher.RunAsync(kind, onlyDownload, progressDelegate, progressStateDelegate, token);
+            await patcher.RunAsync(kind, onlyDownload, progressDelegate, progressStateDelegate, token).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -274,11 +283,11 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 return null;
             }
 
-            await using var stream = await resp.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+            byte[] manifestBytes = await ReadManifestAsync(resp, url, token).ConfigureAwait(false);
 
             try
             {
-                using JsonDocument doc = await JsonDocument.ParseAsync(stream, cancellationToken: token).ConfigureAwait(false);
+                using JsonDocument doc = JsonDocument.Parse(manifestBytes);
                 JsonElement root = doc.RootElement;
 
                 var result = new WuwaApiResponsePatchIndex();
@@ -289,6 +298,11 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 {
                     result.Resource = ParseResourceEntries(resourceElem);
                 }
+
+                if (TryGetPropertyCI(root, "applyTypes", out var types) && types.ValueKind == JsonValueKind.Array &&
+                    types.EnumerateArray().Any(t => t.ValueKind == JsonValueKind.String && t.GetString() == "group") &&
+                    TryGetPropertyCI(root, "groupResource", out var groupResource) && groupResource.ValueKind == JsonValueKind.Array)
+                    result.Resource = ParseResourceEntries(groupResource);
 
                 // Parse "deleteFiles" array
                 if (TryGetPropertyCI(root, "deleteFiles", out JsonElement deleteElem) &&
@@ -322,6 +336,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             continue;
 
                         var group = new WuwaApiResponsePatchGroupInfo();
+                        if (TryGetPropertyCI(groupItem, "dest", out var groupDest) && groupDest.ValueKind == JsonValueKind.String)
+                            group.Dest = groupDest.GetString();
 
                         if (TryGetPropertyCI(groupItem, "srcFiles", out JsonElement srcElem) &&
                             srcElem.ValueKind == JsonValueKind.Array)
@@ -345,7 +361,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     result.Resource.Length, result.DeleteFiles.Length, result.GroupInfos.Length);
                 return result;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 SharedStatic.InstanceLogger.LogError(
                     "[WuwaGameInstaller::DownloadPatchIndexAsync] Parse error: {Err}", ex);
@@ -392,6 +408,9 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                 if (TryGetPropertyCI(item, "dest", out JsonElement destEl) && destEl.ValueKind == JsonValueKind.String)
                     entry.Dest = destEl.GetString();
+
+                if (TryGetPropertyCI(item, "fromFolder", out var fromFolder) && fromFolder.ValueKind == JsonValueKind.String)
+                    entry.FromFolder = fromFolder.GetString();
 
                 if (TryGetPropertyCI(item, "md5", out JsonElement md5El) && md5El.ValueKind == JsonValueKind.String)
                     entry.Md5 = md5El.GetString();
@@ -442,30 +461,10 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
         private static WuwaApiResponsePatchFileRef[] ParseFileRefs(JsonElement arrayElem)
         {
-            var list = new List<WuwaApiResponsePatchFileRef>(arrayElem.GetArrayLength());
-            foreach (var item in arrayElem.EnumerateArray())
+            return ParseResourceEntries(arrayElem).Select(e => new WuwaApiResponsePatchFileRef
             {
-                if (item.ValueKind != JsonValueKind.Object)
-                    continue;
-
-                var fileRef = new WuwaApiResponsePatchFileRef();
-
-                if (TryGetPropertyCI(item, "dest", out JsonElement destEl) && destEl.ValueKind == JsonValueKind.String)
-                    fileRef.Dest = destEl.GetString();
-
-                if (TryGetPropertyCI(item, "md5", out JsonElement md5El) && md5El.ValueKind == JsonValueKind.String)
-                    fileRef.Md5 = md5El.GetString();
-
-                if (TryGetPropertyCI(item, "size", out JsonElement sizeEl))
-                {
-                    if ((sizeEl.ValueKind == JsonValueKind.Number && sizeEl.TryGetUInt64(out ulong uv)) ||
-                        (sizeEl.ValueKind == JsonValueKind.String && ulong.TryParse(sizeEl.GetString(), out uv)))
-                        fileRef.Size = uv;
-                }
-
-                list.Add(fileRef);
-            }
-            return list.ToArray();
+                Dest = e.Dest, Md5 = e.Md5, Size = e.Size, ChunkInfos = e.ChunkInfos
+            }).ToArray();
         }
 
         /// <summary>
@@ -542,7 +541,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     ?? throw new InvalidOperationException("GameManager is not a WuwaGameManager.");
 
                 string installPath = _owner.EnsureAndGetGamePath();
-                string patchTempPath = Path.Combine(installPath, "TempPath", PatchTempDirName);
+                string patchTempPath = _owner.DownloadCachePath(installPath, true);
 
                 // Numeric totals are unknown until the patch index has been parsed.
                 // Do not publish placeholder values that the host may retain for the
@@ -928,16 +927,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 WuwaApiResponseResourceEntry[] krpdiffEntriesToDownload;
                 if (mismatchedDstFiles is { Count: > 0 } && krpdiffEntries.Length > 0)
                 {
-                    // Build group-index → krpdiff entry lookup from krpdiff filenames
-                    var groupToKrpdiffDest = new Dictionary<int, string>();
-                    foreach (var entry in krpdiffEntries)
-                    {
-                        if (string.IsNullOrEmpty(entry.Dest)) continue;
-                        int gIdx = ParseGroupIndex(entry.Dest, patchIndex.GroupInfos.Length);
-                        if (gIdx >= 0)
-                            groupToKrpdiffDest[gIdx] = entry.Dest;
-                    }
-
                     // For each GroupInfo, check if any of its DstFiles need patching
                     var neededKrpdiffDests = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     for (int gi = 0; gi < patchIndex.GroupInfos.Length; gi++)
@@ -953,8 +942,9 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             }
                         }
 
-                        if (groupNeeded && groupToKrpdiffDest.TryGetValue(gi, out string? krpDest))
-                            neededKrpdiffDests.Add(krpDest);
+                        var mapped = FindKrpdiffEntry(krpdiffEntries, gi, patchIndex.GroupInfos.Length, group.Dest);
+                        if (groupNeeded && !string.IsNullOrEmpty(mapped?.Dest))
+                            neededKrpdiffDests.Add(mapped.Dest);
                     }
 
                     if (neededKrpdiffDests.Count > 0)
@@ -988,37 +978,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     krpdiffEntriesToDownload = krpdiffEntries;
                 }
 
-                // ── Step 4: Check for pre-downloaded files (preload scenario) ──
-                bool hasPredownloadedFiles = false;
-                if (!onlyDownload && Directory.Exists(patchTempPath))
-                {
-                    // Verify all NEEDED krpdiff entries exist in the temp directory
-                    hasPredownloadedFiles = krpdiffEntriesToDownload.Length > 0;
-                    foreach (var entry in krpdiffEntriesToDownload)
-                    {
-                        if (string.IsNullOrEmpty(entry.Dest))
-                            continue;
-
-                        string expectedPath = Path.Combine(patchTempPath,
-                            entry.Dest.Replace('/', Path.DirectorySeparatorChar));
-                        if (!File.Exists(expectedPath))
-                        {
-                            hasPredownloadedFiles = false;
-                            SharedStatic.InstanceLogger.LogInformation(
-                                "[Patch::RunAsync] Pre-downloaded file missing: {File}. Will re-download needed patch files.",
-                                entry.Dest);
-                            break;
-                        }
-                    }
-                }
-
-                if (hasPredownloadedFiles)
-                {
-                    SharedStatic.InstanceLogger.LogInformation(
-                        "[Patch::RunAsync] Using pre-downloaded krpdiff files from {Path} ({Count} files verified)",
-                        patchTempPath, krpdiffEntriesToDownload.Length);
-                }
-
                 // ── Step 5: Download patch files ──
                 // Use the ORIGINAL krpdiffEntries.Length to distinguish "has krpdiff-based patching"
                 // from "old-style full replacement". The filtered set (krpdiffEntriesToDownload)
@@ -1029,9 +988,9 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     // Group-based patch mode: download only needed krpdiffs
                     if (krpdiffEntriesToDownload.Length > 0)
                     {
-                        downloadEntries = hasPredownloadedFiles
-                            ? []   // already pre-downloaded
-                            : krpdiffEntriesToDownload;
+                        // The shared download phase verifies and reuses cached files,
+                        // repairing corrupt chunks before any patch is applied.
+                        downloadEntries = krpdiffEntriesToDownload;
                     }
                     else
                     {
@@ -1148,7 +1107,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             if (File.Exists(outputPath))
                             {
                                 var fi = new FileInfo(outputPath);
-                                if (fi.Length == (long)entry.Size)
+                                if (await WuwaFileIntegrity.MatchesAsync(outputPath, entry.Size, entry.Md5, ct).ConfigureAwait(false))
                                 {
                                     SharedStatic.InstanceLogger.LogDebug(
                                         "[Patch::RunAsync] Already downloaded with correct size, skipping: {Dest}",
@@ -1159,6 +1118,14 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                     ReportProgress();
                                     return;
                                 }
+                            }
+
+                            if (File.Exists(outputPath))
+                            {
+                                if (entry.ChunkInfos is { Length: > 0 } && entry.ChunkInfos.All(c => !string.IsNullOrEmpty(c.Md5)))
+                                    File.Move(outputPath, outputPath + ".tmp", overwrite: true);
+                                else
+                                    File.Delete(outputPath);
                             }
 
                             // For full-replacement entries, also check the game install directory.
@@ -1172,7 +1139,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                     {
                                         // Size matches — verify MD5 to ensure the content is
                                         // actually the new version and not a stale file.
-                                        if (!string.IsNullOrEmpty(entry.Md5) && fi.Length <= Md5CheckSizeThreshold)
+                                        if (!string.IsNullOrEmpty(entry.Md5))
                                         {
                                             await using var existFs = File.OpenRead(existingPath);
                                             string existMd5 = await WuwaUtils.ComputeMd5HexAsync(existFs, ct)
@@ -1207,8 +1174,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                             // krpdiff entries use the patch CDN; full-replacement
                             // entries use the target version's resource CDN.
-                            string baseUrl = isKrpdiff ? patchBaseUrl : mainBaseUrl;
-                            string fileUrl = $"{baseUrl}/{entry.Dest}";
+                            string fileUrl = _owner.BuildResourceUrl(isKrpdiff ? patchConfig : targetConfigRef, entry);
                             Uri uri = new(fileUrl, UriKind.Absolute);
 
                             SharedStatic.InstanceLogger.LogDebug(
@@ -1280,7 +1246,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             {
                                 bool matches = true;
                                 // Also verify MD5 to catch stale files with matching size.
-                                if (!string.IsNullOrEmpty(entry.Md5) && installFi.Length <= Md5CheckSizeThreshold)
+                                if (!string.IsNullOrEmpty(entry.Md5))
                                 {
                                     await using var installFs = File.OpenRead(installFilePath);
                                     string installMd5 = await WuwaUtils.ComputeMd5HexAsync(installFs, token)
@@ -1308,12 +1274,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         WuwaApiResponseGameConfigRef? targetConfigRef = kind == GameInstallerKind.Preload
                             ? manager.ApiPredownloadReference
                             : manager.ApiConfigReference;
-                        string cdnHost = (_owner.ApiResponseAssetUrl ?? "").TrimEnd('/');
-                        string relativeBase = (targetConfigRef?.BaseUrl ?? _owner.GameResourceBasisPath ?? "").TrimEnd('/');
-                        string baseUrl = string.IsNullOrEmpty(cdnHost)
-                            ? relativeBase
-                            : $"{cdnHost}/{relativeBase.TrimStart('/')}";
-                        Uri uri = new($"{baseUrl}/{entry.Dest}", UriKind.Absolute);
+                        Uri uri = new(_owner.BuildResourceUrl(targetConfigRef, entry), UriKind.Absolute);
                         Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
                         // This entry was already credited during download. Verify the recovered
                         // temp file below without adding its bytes or file count a second time.
@@ -1331,25 +1292,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             $"Patch file missing after download: {entry.Dest}", filePath);
                     }
 
-                    var fileInfo = new FileInfo(filePath);
-                    if ((ulong)fileInfo.Length != entry.Size)
-                    {
-                        SharedStatic.InstanceLogger.LogWarning(
-                            "[Patch::RunAsync] Size mismatch for {File}: expected={Expected}, actual={Actual}",
-                            entry.Dest, entry.Size, fileInfo.Length);
-                    }
-
-                    // MD5 verification (skip for large files per existing threshold)
-                    if (!string.IsNullOrEmpty(entry.Md5) && fileInfo.Length <= Md5CheckSizeThreshold)
-                    {
-                        await using var fs = File.OpenRead(filePath);
-                        string computedMd5 = await WuwaUtils.ComputeMd5HexAsync(fs, token).ConfigureAwait(false);
-                        if (!string.Equals(computedMd5, entry.Md5, StringComparison.OrdinalIgnoreCase))
-                        {
-                            throw new InvalidOperationException(
-                                $"MD5 mismatch for downloaded file {entry.Dest}: expected={entry.Md5}, computed={computedMd5}");
-                        }
-                    }
+                    await WuwaFileIntegrity.VerifyAsync(filePath, entry.Size, entry.Md5, token).ConfigureAwait(false);
 
                     verifiedDownloadCount++;
                     installProgress.StateCount = verifiedDownloadCount;
@@ -1458,28 +1401,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 WuwaApiResponseGameConfigRef? fallbackTargetConfigRef = kind == GameInstallerKind.Preload
                     ? manager.ApiPredownloadReference
                     : manager.ApiConfigReference;
-                string fallbackCdnHost = (_owner.ApiResponseAssetUrl ?? "").TrimEnd('/');
-                string fallbackRelativeBase = (fallbackTargetConfigRef?.BaseUrl ?? _owner.GameResourceBasisPath ?? "").TrimEnd('/');
-                string fallbackBaseUrl = string.IsNullOrEmpty(fallbackCdnHost)
-                    ? fallbackRelativeBase
-                    : $"{fallbackCdnHost}/{fallbackRelativeBase.TrimStart('/')}";
-
-                string krpdiffRelativeBase = (patchConfig.BaseUrl ?? _owner.GameResourceBasisPath ?? "").TrimEnd('/');
-                string krpdiffCdnHost = (_owner.ApiResponseAssetUrl ?? "").TrimEnd('/');
-                string krpdiffPatchBaseUrl = string.IsNullOrEmpty(krpdiffCdnHost)
-                    ? krpdiffRelativeBase
-                    : $"{krpdiffCdnHost}/{krpdiffRelativeBase.TrimStart('/')}";
-
-                var resourceDestLookup = new Dictionary<string, WuwaApiResponseResourceEntry>(
-                    StringComparer.OrdinalIgnoreCase);
-                foreach (var entry in patchIndex.Resource)
-                {
-                    if (string.IsNullOrEmpty(entry.Dest))
-                        continue;
-                    if (IsBinaryPatchFileName(entry.Dest))
-                        continue;
-                    resourceDestLookup.TryAdd(entry.Dest, entry);
-                }
+                Dictionary<string, WuwaApiResponseResourceEntry>? resourceDestLookup = null;
 
                 async Task DownloadReplacementFromCdnAsync(
                     WuwaApiResponsePatchFileRef dstRef,
@@ -1491,6 +1413,15 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     string dstRelative = dstRef.Dest.Replace('/', Path.DirectorySeparatorChar);
                     string finalDst = Path.Combine(installPath, dstRelative);
 
+                    if (resourceDestLookup == null)
+                    {
+                        if (fallbackTargetConfigRef == null)
+                            throw new InvalidDataException("Missing target resource configuration.");
+                        string targetIndexUrl = $"{_owner.ApiResponseAssetUrl?.TrimEnd('/')}/{fallbackTargetConfigRef.IndexFile?.TrimStart('/')}";
+                        var targetIndex = await _owner.FetchResourceIndexAsync(targetIndexUrl, token).ConfigureAwait(false)
+                            ?? throw new InvalidDataException("Missing target resource manifest for patch recovery.");
+                        resourceDestLookup = WuwaSourceReconciliation.BuildResourceLookup(targetIndex);
+                    }
                     resourceDestLookup.TryGetValue(dstRef.Dest, out WuwaApiResponseResourceEntry? resourceEntry);
 
                     string expectedMd5 = resourceEntry?.Md5 ?? dstRef.Md5 ?? "";
@@ -1534,8 +1465,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         }
                     }
 
-                    string encodedDest = EncodePathSegments(dstRef.Dest);
-                    string fileUrl = $"{fallbackBaseUrl}/{encodedDest}";
+                    string fileUrl = _owner.BuildResourceUrl(fallbackTargetConfigRef,
+                        resourceEntry ?? new WuwaApiResponseResourceEntry { Dest = dstRef.Dest });
                     Uri uri = new(fileUrl, UriKind.Absolute);
 
                     string? dstDir = Path.GetDirectoryName(finalDst);
@@ -1635,14 +1566,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     int completedGroups = 0;
                     long cumulativeExpectedBytes = 0; // exact byte total after each completed group
 
-                    // Track consecutive patch failures to detect systemic source mismatch.
-                    // If multiple groups fail post-patch verification in a row, the user's
-                    // installation is likely from a different build — skip remaining patches
-                    // and download directly from CDN to avoid wasting time.
-                    const int patchFailureThreshold = 2;
-                    int consecutivePatchFailures = 0;
-                    bool forceDirectDownload = false;
-
                     for (int groupIdx = 0; groupIdx < patchIndex.GroupInfos.Length; groupIdx++)
                     {
                         token.ThrowIfCancellationRequested();
@@ -1690,30 +1613,16 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             continue;
                         }
 
-                        // ─ Force-download bypass: if prior groups showed systemic source mismatch ─
-                        if (forceDirectDownload)
-                        {
-                            await DownloadGroupDestinationsFromCdnAsync(
-                                groupIdx,
-                                group,
-                                $"skipping patch (prior groups failed source validation) — downloading from CDN.");
-                            cumulativeExpectedBytes += groupExpectedBytes;
-                            Interlocked.Exchange(ref installProgress.DownloadedBytes, cumulativeExpectedBytes);
-                            ReportProgress();
-                            completedGroups++;
-                            continue;
-                        }
-
                         // ─ Find the krpdiff for this group ─
                         string krpdiffPath = FindKrpdiffFile(
                             patchTempPath,
                             group.DstFiles[0].Dest ?? "",
                             krpdiffEntries,
                             groupIdx,
-                            patchIndex.GroupInfos.Length);
+                            patchIndex.GroupInfos.Length, group.Dest);
 
                         WuwaApiResponseResourceEntry? krpdiffEntry =
-                            FindKrpdiffEntry(krpdiffEntries, groupIdx, patchIndex.GroupInfos.Length);
+                            FindKrpdiffEntry(krpdiffEntries, groupIdx, patchIndex.GroupInfos.Length, group.Dest);
                         if (krpdiffEntry != null)
                         {
                             string? krpdiffIssue = await WuwaPatchPreflight.ValidateLocalFileAsync(
@@ -1727,8 +1636,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
                                 try
                                 {
-                                    string encodedKrpdiff = EncodePathSegments(krpdiffEntry.Dest ?? "");
-                                    string krpdiffUrl = $"{krpdiffPatchBaseUrl}/{encodedKrpdiff}";
+                                    string krpdiffUrl = _owner.BuildResourceUrl(patchConfig, krpdiffEntry);
                                     Uri krpdiffUri = new(krpdiffUrl, UriKind.Absolute);
 
                                     if (krpdiffEntry.ChunkInfos is { Length: > 0 })
@@ -2121,16 +2029,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                     $"patch failed and destinations don't match — downloading {group.DstFiles.Length} file(s) from CDN as fallback.",
                                     restoreStateCountBefore: stateCountBeforePatch);
 
-                                // Count as a patch failure for force-download escalation.
-                                consecutivePatchFailures++;
-                                if (consecutivePatchFailures >= patchFailureThreshold && !forceDirectDownload)
-                                {
-                                    forceDirectDownload = true;
-                                    SharedStatic.InstanceLogger.LogWarning(
-                                        "[Patch::RunAsync] {Count} consecutive groups failed patching — " +
-                                        "remaining groups will download directly from CDN.",
-                                        consecutivePatchFailures);
-                                }
                             }
                             else
                             {
@@ -2165,8 +2063,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         //   2. If install file already matches target → skip (previous move)
                         //   3. Otherwise → download from CDN as fallback
                         int verifiedFileCount = 0;
-                        bool groupHadPatchMismatch = false;
-                        foreach (var dstRef in group.DstFiles)
+                            foreach (var dstRef in group.DstFiles)
                         {
                             if (string.IsNullOrEmpty(dstRef.Dest))
                                 continue;
@@ -2220,8 +2117,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                                         StringComparison.OrdinalIgnoreCase))
                                 {
                                     patchOutputValid = false;
-                                    groupHadPatchMismatch = true;
-                                    SharedStatic.InstanceLogger.LogWarning(
+                                        SharedStatic.InstanceLogger.LogWarning(
                                         "[Patch::RunAsync] Post-patch MD5 mismatch for {Dst}: expected={Expected}, computed={Computed}. " +
                                         "Patch output failed integrity verification. Recovering via CDN.",
                                         dstRef.Dest, dstRef.Md5, outMd5);
@@ -2324,24 +2220,6 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                             "[Patch::RunAsync] Completed group {Idx}: {Count} files patched.",
                             groupIdx, group.DstFiles.Length);
 
-                        // Track consecutive patch failures for force-download escalation.
-                        if (groupHadPatchMismatch)
-                        {
-                            consecutivePatchFailures++;
-                            if (consecutivePatchFailures >= patchFailureThreshold && !forceDirectDownload)
-                            {
-                                forceDirectDownload = true;
-                                SharedStatic.InstanceLogger.LogWarning(
-                                    "[Patch::RunAsync] {Count} consecutive groups produced wrong output — " +
-                                    "source files appear to be from a different build. " +
-                                    "Remaining groups will download directly from CDN.",
-                                    consecutivePatchFailures);
-                            }
-                        }
-                        else
-                        {
-                            consecutivePatchFailures = 0;
-                        }
                     }
 
                     SharedStatic.InstanceLogger.LogInformation(
@@ -2358,7 +2236,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                     ReportProgress();
                     foreach (var deleteEntry in patchIndex.DeleteFiles)
                     {
-                        if (string.IsNullOrEmpty(deleteEntry.Dest))
+                        if (string.IsNullOrEmpty(deleteEntry.Dest) ||
+                            _owner._retainedPackFiles?.Contains(deleteEntry.Dest.Replace('\\', '/')) == true)
                             continue;
 
                         string filePath = Path.Combine(installPath,
@@ -2489,6 +2368,9 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 Action reportProgress,
                 CancellationToken token)
             {
+                // Legacy source URL derivation identifies a game version, not a pack.
+                // Pack groups still validate their source files and recover individually.
+                if (manager.IsOperationContext) return;
                 var sourceRefs = WuwaSourceReconciliation.CollectSourceRefs(patchIndex);
                 if (sourceRefs.Count == 0)
                     return;
@@ -2667,8 +2549,11 @@ namespace Hi3Helper.Plugin.Wuwa.Management
             private static WuwaApiResponseResourceEntry? FindKrpdiffEntry(
                 WuwaApiResponseResourceEntry[] krpdiffEntries,
                 int groupIndex,
-                int groupCount)
+                int groupCount,
+                string? explicitDest = null)
             {
+                if (!string.IsNullOrEmpty(explicitDest))
+                    return krpdiffEntries.FirstOrDefault(e => string.Equals(e.Dest, explicitDest, StringComparison.OrdinalIgnoreCase));
                 if (groupIndex < 0)
                     return null;
 
@@ -2692,8 +2577,16 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 string dstDest,
                 WuwaApiResponseResourceEntry[] krpdiffEntries,
                 int groupIndex = -1,
-                int groupCount = 0)
+                int groupCount = 0,
+                string? explicitDest = null)
             {
+                if (!string.IsNullOrEmpty(explicitDest))
+                {
+                    var mapped = FindKrpdiffEntry(krpdiffEntries, groupIndex, groupCount, explicitDest);
+                    string mappedPath = Path.Combine(patchTempPath, (mapped?.Dest ?? explicitDest).Replace('/', Path.DirectorySeparatorChar));
+                    if (mapped != null && File.Exists(mappedPath)) return mappedPath;
+                    throw new FileNotFoundException($"Missing explicitly mapped patch: {explicitDest}");
+                }
                 // Strategy 0 (preferred): Find krpdiff by matching group index in its filename
                 if (groupIndex >= 0)
                 {

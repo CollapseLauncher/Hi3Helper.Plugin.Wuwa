@@ -189,7 +189,7 @@ internal partial class WuwaGameManager : GameManagerBase
         get
         {
             bool result = IsInstalled &&
-                          (ApiGameVersion != CurrentGameVersion ||
+                          (ApiGameVersion != CurrentGameVersion || HasResourcePackUpdate ||
                            HasPendingPreloadPatch ||
                            HasKnownHotfixUpdate);
             if (_lastHasUpdate != result)
@@ -339,7 +339,7 @@ internal partial class WuwaGameManager : GameManagerBase
 
     internal async Task<int> InitAsyncInner(bool forceInit = false, CancellationToken token = default)
     {
-        if (!forceInit && IsInitialized)
+        if (IsOperationContext || (!forceInit && IsInitialized))
             return 0;
 
         string gameConfigUrl =
@@ -357,6 +357,8 @@ internal partial class WuwaGameManager : GameManagerBase
         WuwaApiResponseGameConfig? tmp = JsonSerializer.Deserialize<WuwaApiResponseGameConfig>(jsonResponse,
             WuwaApiResponseContext.Default.WuwaApiResponseGameConfig);
         ApiGameConfigResponse = tmp ?? throw new JsonException("Failed to deserialize API game config response.");
+
+        NormalizeResourcePacks();
 
         if (ApiGameConfigResponse.Default?.ConfigReference == null)
             throw new NullReferenceException("ApiGameConfigResponse.ResponseData is null");
@@ -398,6 +400,8 @@ internal partial class WuwaGameManager : GameManagerBase
         }
 
         // Re-check Kuro's launcherDownloadConfig.json now that the live API version is known.
+        if (UsesResourcePacks) return 0;
+
         TryCrossCheckKuroLauncherVersion();
 
         // If metadata is still stale but on-disk files already match the target version
@@ -705,6 +709,8 @@ internal partial class WuwaGameManager : GameManagerBase
 
         try
         {
+            if (UsesResourcePacks || JsonNode.Parse(File.ReadAllText(kuroConfigPath))?["bundles"] != null)
+                return;
             WuwaLauncherDownloadConfig? kuroConfig;
             using (FileStream fs = File.OpenRead(kuroConfigPath))
             {
@@ -794,6 +800,7 @@ internal partial class WuwaGameManager : GameManagerBase
 
     public override void SaveConfig()
     {
+        if (IsOperationContext) return;
         if (string.IsNullOrEmpty(CurrentGameInstallPath))
         {
             SharedStatic.InstanceLogger.LogWarning(
@@ -911,47 +918,19 @@ internal partial class WuwaGameManager : GameManagerBase
         const string fileName = "launcherDownloadConfig.json";
         string configPath = Path.Combine(installPath, fileName);
 
-        // Start from any existing data so we preserve fields like appId.
-        var cfg = new WuwaLauncherDownloadConfig
-        {
-            Version      = version,
-            ReUseVersion = string.Empty,
-            State        = string.Empty,
-            IsPreDownload = false,
-        };
-
-        if (File.Exists(configPath))
-        {
-            try
-            {
-                using var readFs = File.OpenRead(configPath);
-                var existing = JsonSerializer.Deserialize(readFs,
-                    WuwaApiResponseContext.Default.WuwaLauncherDownloadConfig);
-                if (existing != null)
-                {
-                    // Carry over fields we don't want to overwrite.
-                    cfg.AppId         = existing.AppId;
-                    cfg.ReUseVersion  = existing.ReUseVersion ?? string.Empty;
-                    cfg.State         = existing.State         ?? string.Empty;
-                    cfg.IsPreDownload = false; // always clear the pre-download flag after a full update
-                }
-            }
-            catch (Exception ex)
-            {
-                SharedStatic.InstanceLogger.LogWarning(
-                    "[WuwaGameManager::TryUpdateLauncherDownloadConfig] Could not read existing {File}: {Err}",
-                    fileName, ex.Message);
-            }
-        }
-
         try
         {
+            // Preserve bundles and fields introduced by newer launchers.
+            JsonObject cfg = File.Exists(configPath)
+                ? JsonNode.Parse(File.ReadAllText(configPath))?.AsObject()
+                  ?? throw new JsonException("Launcher download config is empty.")
+                : new JsonObject { ["reUseVersion"] = "", ["state"] = "" };
+            cfg["version"] = version;
+            cfg["isPreDownload"] = false;
             string tempPath = configPath + ".tmp";
             using (var writeFs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
-            {
-                JsonSerializer.Serialize(writeFs, cfg,
-                    WuwaApiResponseContext.Default.WuwaLauncherDownloadConfig);
-            }
+            using (var writer = new Utf8JsonWriter(writeFs))
+                cfg.WriteTo(writer);
             File.Move(tempPath, configPath, overwrite: true);
             SharedStatic.InstanceLogger.LogInformation(
                 "[WuwaGameManager::TryUpdateLauncherDownloadConfig] Updated {File} → version={Version}",
@@ -973,6 +952,7 @@ internal partial class WuwaGameManager : GameManagerBase
     /// </summary>
     internal void TryWriteLocalGameResources(string installPath, WuwaApiResponseResourceIndex index)
     {
+        if (IsOperationContext) return;
         const string fileName = "LocalGameResources.json";
         string configPath = Path.Combine(installPath, fileName);
 
@@ -1072,6 +1052,21 @@ internal partial class WuwaGameManager : GameManagerBase
         return null;
     }
 
+    internal string? GetManifestMd5(string url)
+    {
+        foreach (var target in new[] { ApiConfigReference, ApiPredownloadReference })
+        {
+            if (target == null) continue;
+            foreach (var config in new[] { target }.Concat(target.PatchConfig ?? []))
+                if (!string.IsNullOrEmpty(config.IndexFile) &&
+                    string.Equals($"{ApiResponseAssetUrl.TrimEnd('/')}/{config.IndexFile.TrimStart('/')}", url, StringComparison.OrdinalIgnoreCase))
+                    return config.IndexFileMd5;
+        }
+        if (CurrentGameConfigNode["resourceIndexUrl"]?.GetValue<string>() == url)
+            return CurrentGameConfigNode["resourceIndexMd5"]?.GetValue<string>();
+        return null;
+    }
+
     internal WuwaApiResponseGameConfigRef? ApiConfigReference
         => ApiGameConfigResponse?.Default?.ConfigReference;
 
@@ -1163,6 +1158,7 @@ internal partial class WuwaGameManager : GameManagerBase
         }
 
         urls = new VersionResourceUrls(resolvedIndexUrl, resolvedBaseUrl);
+        CurrentGameConfigNode.Remove("resourceIndexMd5");
         CurrentGameConfigNode["resourceIndexUrl"] = resolvedIndexUrl;
         CurrentGameConfigNode["resourceBaseUrl"] = resolvedBaseUrl;
 
@@ -1195,6 +1191,7 @@ internal partial class WuwaGameManager : GameManagerBase
         if (string.IsNullOrEmpty(GameResourceBaseUrl) || string.IsNullOrEmpty(GameResourceBasisPath))
             return;
 
+        CurrentGameConfigNode["resourceIndexMd5"] = ApiConfigReference?.IndexFileMd5;
         CurrentGameConfigNode["resourceIndexUrl"] = GameResourceBaseUrl;
         CurrentGameConfigNode["resourceBaseUrl"] = GameResourceBasisPath;
     }
