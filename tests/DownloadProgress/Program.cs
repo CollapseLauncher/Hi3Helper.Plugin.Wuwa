@@ -62,8 +62,11 @@ sealed class RetryHandler(byte[] data, bool restart, int failOnRequest) : HttpMe
         Stream body = call == failOnRequest
             ? new FailingStream(data[start..(start + 3)])
             : new MemoryStream(data[start..(end + 1)]);
-        return Task.FromResult(new HttpResponseMessage(range == null || ignoreRange
-            ? HttpStatusCode.OK : HttpStatusCode.PartialContent) { Content = new StreamContent(body) });
+        var response = new HttpResponseMessage(range == null || ignoreRange
+            ? HttpStatusCode.OK : HttpStatusCode.PartialContent) { Content = new StreamContent(body) };
+        if (range != null && !ignoreRange)
+            response.Content.Headers.ContentRange = new(start, end, data.Length);
+        return Task.FromResult(response);
     }
 }
 

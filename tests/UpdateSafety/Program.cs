@@ -23,6 +23,21 @@ try
         "ManifestLauncher_ls_3.6.13_3.6.14.hp"
     }), "Collect both Launcher groups from observed update");
 
+    Mount("3.6.0", "Resource");
+    Mount("3.6.0", "Resource_HD");
+    using var resourceClient = new HttpClient(new MetadataHandler(resourceUpdates: true));
+    var resourcePatch = await WuwaKnownHotfixPatch.DiscoverAsync(root, "3.6.1", resourceClient, default)
+        ?? throw new Exception("Resource hotfix not discovered");
+    Check(resourcePatch.Components.Select(x => x.ResourceType).ToHashSet().SetEquals(
+        new[] { "Resource", "Resource_HD" }), "Discover ordinary and HD resource hotfixes without Launcher update");
+    Check(resourcePatch.Files.Where(x => x.ResourceType == "Resource").Select(x => x.Name).ToHashSet().SetEquals(new[]
+    {
+        "ManifestResource_g1_3.6.13_3.6.14.hp",
+        "ManifestResource_g4_3.6.13_3.6.14.hp",
+        "ManifestResource_ls_3.6.13_3.6.14.hp"
+    }), "Discover through last segment when g0 is absent and retain groups after gaps");
+    Check(resourcePatch.CanApply(root), "HD and sparse resource patches can apply to mounted sources");
+
     foreach (bool malformed in new[] { false, true })
     {
         using var failedClient = new HttpClient(new MetadataHandler(failGroup: true, malformed: malformed));
@@ -62,13 +77,13 @@ finally
     Directory.Delete(root, recursive: true);
 }
 
-void Mount(string package)
+void Mount(string package, string resourceType = "Launcher")
 {
     string packageRoot = Path.Combine(root, "Client", "Saved", "Resources", package);
-    Directory.CreateDirectory(Path.Combine(packageRoot, "Launcher", "3.6.13"));
+    Directory.CreateDirectory(Path.Combine(packageRoot, resourceType, "3.6.13"));
     Directory.CreateDirectory(Path.Combine(packageRoot, "Mount"));
-    File.WriteAllText(Path.Combine(packageRoot, "Mount", "MountLauncher.txt"),
-        "::Mount::\nLauncher/3.6.13/pakchunk1,17,hash,,,\n::Del::\n");
+    File.WriteAllText(Path.Combine(packageRoot, "Mount", $"Mount{resourceType}.txt"),
+        $"::Mount::\n{resourceType}/3.6.13/pakchunk1,17,hash,,,\n::Del::\n");
 }
 
 static void Check(bool condition, string name)
@@ -88,13 +103,21 @@ static async Task ExpectFailure(Func<Task> action, string name)
     throw new Exception("Expected failure: " + name);
 }
 
-sealed class MetadataHandler(bool failGroup = false, bool malformed = false) : HttpMessageHandler
+sealed class MetadataHandler(bool failGroup = false, bool malformed = false, bool resourceUpdates = false) : HttpMessageHandler
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
     {
         string name = Path.GetFileName(request.RequestUri!.AbsolutePath);
         bool exists = name is "ManifestLauncher_g0_3.6.13_3.6.14.hp"
             or "ManifestLauncher_ls_3.6.13_3.6.14.hp" or "ManifestLauncher.txt";
+        if (resourceUpdates)
+            exists = name is "ManifestResource_ls_3.6.13_3.6.14.hp"
+                or "ManifestResource_g1_3.6.13_3.6.14.hp"
+                or "ManifestResource_g4_3.6.13_3.6.14.hp"
+                or "ManifestResource.txt"
+                or "ManifestResource_HD_ls_3.6.13_3.6.14.hp"
+                or "ManifestResource_HD_g0_3.6.13_3.6.14.hp"
+                or "ManifestResource_HD.txt";
         if (failGroup && name.StartsWith("ManifestLauncher_g0"))
         {
             if (!malformed)
