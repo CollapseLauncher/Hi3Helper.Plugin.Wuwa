@@ -37,6 +37,9 @@ public class WuwaApiResponsePatchDeleteEntry
 /// </summary>
 public class WuwaApiResponsePatchGroupInfo
 {
+    [JsonPropertyName("dest")]
+    public string? Dest { get; set; }
+
     [JsonPropertyName("srcFiles")]
     public WuwaApiResponsePatchFileRef[] SrcFiles { get; set; } = [];
 

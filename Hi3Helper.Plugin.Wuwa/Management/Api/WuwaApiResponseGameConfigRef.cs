@@ -11,6 +11,12 @@ public class WuwaApiResponseGameConfigRef
     [JsonPropertyName("indexFile")] // Mapping: root -> default -> config -> indexFile
     public string? IndexFile { get; set; }
 
+    [JsonPropertyName("indexFileMd5")]
+    public string? IndexFileMd5 { get; set; }
+
+    [JsonPropertyName("folder")]
+    public string? Folder { get; set; }
+
     [JsonPropertyName("version")] // Mapping: root -> default -> config -> version
     [JsonConverter(typeof(GameVersionJsonConverter))]
     public GameVersion CurrentVersion { get; set; }
