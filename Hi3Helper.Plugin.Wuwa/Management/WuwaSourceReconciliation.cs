@@ -285,7 +285,8 @@ internal static class WuwaSourceReconciliation
         Uri uri = new(fileUrl, UriKind.Absolute);
 
         string relativePath = dest.Replace('/', Path.DirectorySeparatorChar);
-        string outputPath = Path.Combine(installPath, relativePath);
+        string destination = Path.Combine(installPath, relativePath);
+        string outputPath = destination + ".source-repair";
         string? outputDir = Path.GetDirectoryName(outputPath);
         if (!string.IsNullOrEmpty(outputDir))
             Directory.CreateDirectory(outputDir);
@@ -302,25 +303,7 @@ internal static class WuwaSourceReconciliation
                 uri, outputPath, dest, token, downloadBytesCallback).ConfigureAwait(false);
         }
 
-        if (!string.IsNullOrEmpty(expectedMd5))
-        {
-            await using var stream = File.OpenRead(outputPath);
-            string md5 = await WuwaUtils.ComputeMd5HexAsync(stream, hashBytesCallback, token).ConfigureAwait(false);
-            if (!string.Equals(md5, expectedMd5, StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException(
-                    $"Repaired source file MD5 mismatch for {dest}: expected={expectedMd5}, computed={md5}");
-            }
-        }
-        else if (expectedSize > 0)
-        {
-            var fi = new FileInfo(outputPath);
-            if ((ulong)fi.Length != expectedSize)
-            {
-                throw new InvalidOperationException(
-                    $"Repaired source file size mismatch for {dest}: expected={expectedSize}, actual={fi.Length}");
-            }
-        }
+        await WuwaFileIntegrity.CommitAsync(outputPath, destination, expectedSize, expectedMd5, token).ConfigureAwait(false);
 
         SharedStatic.InstanceLogger.LogDebug(
             "[WuwaSourceReconciliation] Repaired source file: {Dest}", dest);

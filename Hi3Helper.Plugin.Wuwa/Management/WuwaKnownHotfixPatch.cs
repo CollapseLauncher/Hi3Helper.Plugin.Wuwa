@@ -34,7 +34,7 @@ internal sealed class WuwaKnownHotfixPatch
         "AAcNThIADwwWB04LFE4OAE0CCApOBAIOBk0NBhdMExEMB0wADwoGDRdMFBIwNC5QNBkIUxoaOwckOTYZWwQlDA0sIhdbEAgXCDRMNAoNBwwUEA"
             .AeonPlsHelpMe();
     private static readonly Regex MountVersionRegex = new(
-        @"^(?:Launcher|Resource)/(?<version>\d+\.\d+\.\d+)/",
+        @"^(?:Launcher|Resource|Resource_HD)/(?<version>\d+\.\d+\.\d+)/",
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline);
 
     internal WuwaKnownHotfixPatch(
@@ -68,7 +68,7 @@ internal sealed class WuwaKnownHotfixPatch
             return null;
 
         var components = new List<WuwaHotfixComponent>(2);
-        foreach (string resourceType in new[] { "Launcher", "Resource" })
+        foreach (string resourceType in new[] { "Launcher", "Resource", "Resource_HD" })
         {
             string? sourceVersion = FindMountedSourceVersion(gamePath, resourcePackageVersion, resourceType);
             if (sourceVersion == null)
@@ -138,9 +138,7 @@ internal sealed class WuwaKnownHotfixPatch
         {
             token.ThrowIfCancellationRequested();
             string candidate = $"{source.Major}.{source.Minor}.{source.Build + increment}";
-            string probeName = resourceType == "Launcher"
-                ? $"ManifestLauncher_ls_{sourceVersion}_{candidate}.hp"
-                : $"ManifestResource_g0_{sourceVersion}_{candidate}.hp";
+            string probeName = $"Manifest{resourceType}_ls_{sourceVersion}_{candidate}.hp";
             if (await TryGetMetadataAsync(
                     client, $"{WindowsCdnRoot}/{candidate}/{probeName}", token)
                 .ConfigureAwait(false) != null)
@@ -161,7 +159,7 @@ internal sealed class WuwaKnownHotfixPatch
             WuwaHotfixPatchFile? file = await CreateFileAsync(
                 client, baseUrl, resourceType, name, token).ConfigureAwait(false);
             if (file == null)
-                break;
+                continue;
             files.Add(file);
             if (group == 255)
                 throw new InvalidDataException("Hotfix group discovery exceeded its limit.");
@@ -206,7 +204,8 @@ internal sealed class WuwaKnownHotfixPatch
             .Where(name => Version.TryParse(name, out Version? version) &&
                 version.Major == package.Major && version.Minor == package.Minor && version <= package)
             .Where(name => FindMountedSourceVersion(gamePath, name!, "Launcher") != null ||
-                FindMountedSourceVersion(gamePath, name!, "Resource") != null)
+                FindMountedSourceVersion(gamePath, name!, "Resource") != null ||
+                FindMountedSourceVersion(gamePath, name!, "Resource_HD") != null)
             .Select(name => name!)
             .ToArray();
         if (candidates.Length > 1)
