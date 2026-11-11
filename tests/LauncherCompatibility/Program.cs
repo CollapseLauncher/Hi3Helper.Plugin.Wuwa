@@ -178,12 +178,23 @@ try
         Assert(downloads == 1 && File.Exists(Path.Combine(temp, ".version")) && (string?)JsonNode.Parse(File.ReadAllText(Path.Combine(dir, "app-game-config.json")))!["version"] == "3.6.1", "Preload cache/version behavior incorrect");
     });
 
+    foreach (string bundleName in new[] { "default", "HD", "SD", "UHD" })
     foreach (bool preload in new[] { false, true })
-    await Test("V2 two-pack " + (preload ? "preload then update reuses cache" : "update and version records"), async () =>
+    await Test("V2 two-pack " + bundleName + " " + (preload ? "preload then update reuses cache" : "update and version records"), async () =>
     {
         string dir = Fresh(), first = Manifest("base.bin", data, "override"), second = Manifest("audio.bin", data);
         string config = V2(Pack("base.json", first), Pack("audio.json", second, "audio"), preload);
-        File.WriteAllText(Path.Combine(dir, "launcherDownloadConfig.json"), """{"custom":42,"bundles":{"other":{"version":"1.0.0","state":"repairing","resourcePacks":["shared"]}}}""");
+        config = config.Replace("\"default\":", "\"" + bundleName + "\":");
+        if (bundleName is "SD" or "UHD")
+        {
+            var alternatives = JsonNode.Parse(config)!;
+            alternatives["bundles"]!["HD"] = new JsonObject { ["resourcePacks"] = new JsonArray("unselected") };
+            if (preload) alternatives["predownload"]!["bundles"]!["HD"] = alternatives["bundles"]!["HD"]!.DeepClone();
+            config = alternatives.ToJsonString();
+        }
+        var installed = JsonNode.Parse("""{"custom":42,"bundles":{"other":{"version":"1.0.0","state":"repairing","resourcePacks":["shared"]}}}""")!;
+        if (bundleName is "SD" or "UHD") installed["bundles"]![bundleName] = new JsonObject { ["version"] = "3.6.1" };
+        File.WriteAllText(Path.Combine(dir, "launcherDownloadConfig.json"), installed.ToJsonString());
         int downloads = 0;
         using var client = new HttpClient(new Handler(request => request.RequestUri!.AbsolutePath switch
         {
@@ -204,11 +215,63 @@ try
         foreach (string name in new[] { "base", "audio" })
             Assert((string?)JsonNode.Parse(File.ReadAllText(Path.Combine(dir, "launcherDownloadConfig", name + ".json")))!["version"] == "3.7.0", "Pack version missing");
         var root = JsonNode.Parse(File.ReadAllText(Path.Combine(dir, "launcherDownloadConfig.json")))!;
-        Assert((int?)root["custom"] == 42 && (string?)root["bundles"]!["other"]!["state"] == "repairing" && root["bundles"]!["default"]!["resourcePacks"]!.AsArray().Count == 2, "Bundle metadata lost");
+        Assert((int?)root["custom"] == 42 && (string?)root["bundles"]!["other"]!["state"] == "repairing" && root["bundles"]![bundleName]!["resourcePacks"]!.AsArray().Count == 2, "Bundle metadata lost");
+        Assert(bundleName == "default" || root["bundles"]!["default"] == null, "Created an unrelated default bundle");
         var local = JsonNode.Parse(File.ReadAllText(Path.Combine(dir, "LocalGameResources.json")))!;
         Assert(local["resource"]!.AsArray().Count == 2, "Pack manifests not merged");
         await Run(installer, GameInstallerKind.Update);
         Assert(downloads == 2, "Completed packs redownloaded");
+    });
+
+    await Test("official endpoint exposes preload while current bundle needs update", async () =>
+    {
+        string dir = Fresh(), manifest = Manifest("payload.bin", data);
+        var config = JsonNode.Parse(V2(Pack("current.json", manifest, version: "3.7.2"),
+            Pack("current.json", manifest, version: "3.7.2"), true))!;
+        foreach (var section in new[] { config, config["predownload"]! })
+        {
+            section["bundles"]!["HD"] = section["bundles"]!["default"]!.DeepClone();
+            section["bundles"]!.AsObject().Remove("default");
+        }
+        foreach (var pack in config["predownload"]!["resourcePacks"]!.AsObject())
+        {
+            pack.Value!["version"] = "3.8.0";
+            pack.Value["indexFile"] = "preload.json";
+        }
+        foreach (string file in new[] { "Client/Binaries/Win64/Client-Win64-ShippingBase.dll",
+                     "Client/Binaries/Win64/Client-Win64-Shipping.exe",
+                     "Client/Binaries/Win64/ThirdParty/KrPcSdk_Global/KRSDKRes/KRSDK.bin", "app-game-config.json" })
+        {
+            string path = Path.Combine(dir, file);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, file.EndsWith(".json") ? "{\"version\":\"3.7.1\"}" : "installed");
+        }
+        string installed = """{"version":"3.7.1","bundles":{"HD":{"version":"3.7.1","state":"","resourcePacks":["base","audio"]}}}""";
+        File.WriteAllText(Path.Combine(dir, "launcherDownloadConfig.json"), installed);
+        const string endpoint = "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/50004_P7xcUZnEr1AXIGON25E6KjpOgTlVrg6e/G153/official/index.json";
+        var preset = new Hi3Helper.Plugin.Wuwa.Management.PresetConfig.WuwaGlobalPresetConfig();
+        Assert((string?)managerType.GetProperty("GameConfigUrl", flags)!.GetValue(preset.GameManager) == endpoint, "Global preset uses the legacy endpoint");
+        var steam = new Hi3Helper.Plugin.Wuwa.Management.PresetConfig.WuwaSteamPresetConfig();
+        Assert((string?)managerType.GetProperty("GameConfigUrl", flags)!.GetValue(steam.GameManager) == endpoint, "Steam preset uses the legacy endpoint");
+        int downloads = 0;
+        using var client = new HttpClient(new Handler(request => request.RequestUri!.AbsoluteUri switch
+        {
+            endpoint => Json(config.ToJsonString()),
+            "https://example.test/preload.json" => Json(manifest),
+            "https://example.test/base/payload.bin" => Download(),
+            _ => throw new Exception("Unexpected request: " + request.RequestUri)
+        }));
+        HttpResponseMessage Download() { downloads++; return Bytes(data); }
+        object manager = Manager(client, dir, "3.7.1");
+        Set(manager, "GameConfigUrl", endpoint);
+        await Invoke(manager, "InitAsyncInner", true, CancellationToken.None);
+        ((IGameManager)manager).IsGameHasUpdate(out bool update);
+        ((IGameManager)manager).IsGameHasPreload(out bool preload);
+        ((IGameManager)manager).GetApiPreloadGameVersion(out var version);
+        Assert(update && preload && version == new GameVersion("3.8.0"), "Upcoming preload hidden by current update");
+        await Run(Installer(manager, client), GameInstallerKind.Preload);
+        Assert(downloads == 2 && !File.Exists(Path.Combine(dir, "payload.bin")), "Preload did not cache both packs without installing");
+        Assert(File.ReadAllText(Path.Combine(dir, "launcherDownloadConfig.json")) == installed, "Preload changed installed bundle metadata");
     });
 
     await Test("V2 second-pack failure preserves completed pack and bundle version", async () =>

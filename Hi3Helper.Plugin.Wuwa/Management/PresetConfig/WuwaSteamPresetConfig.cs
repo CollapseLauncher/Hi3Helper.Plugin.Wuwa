@@ -22,7 +22,7 @@ public partial class WuwaSteamPresetConfig : WuwaGlobalPresetConfig
 
 	public override IGameManager? GameManager
 	{
-		get => field ??= new WuwaGameManager(ExecutableName, ApiResponseAssetUrl, AuthenticationHash, CurrentTag, Hash1);
+		get => field ??= new WuwaGameManager(ExecutableName, ApiResponseAssetUrl, AuthenticationHash, CurrentTag, Hash1) { GameConfigUrl = GlobalGameConfigUrl };
 		set;
 	}
 

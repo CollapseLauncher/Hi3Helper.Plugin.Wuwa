@@ -13,13 +13,14 @@ internal partial class WuwaGameManager
 {
     internal bool IsOperationContext { get; private set; }
     internal bool UsesResourcePacks => ApiGameConfigResponse?.ResourcePacks is { Count: > 0 };
+    private string ResourceBundleName { get; set; } = "default";
 
     internal KeyValuePair<string, WuwaApiResponseGameConfigRef>[] GetResourcePacks(bool preload)
     {
         var bundles = preload ? ApiGameConfigResponse?.PredownloadReference?.Bundles : ApiGameConfigResponse?.Bundles;
         var packs = preload ? ApiGameConfigResponse?.PredownloadReference?.ResourcePacks : ApiGameConfigResponse?.ResourcePacks;
-        if (packs == null || bundles == null || !bundles.TryGetValue("default", out var bundle) || bundle.ResourcePacks.Length == 0)
-            throw new InvalidDataException("Resource configuration has no default bundle.");
+        if (packs == null || bundles == null || !bundles.TryGetValue(ResourceBundleName, out var bundle) || bundle.ResourcePacks.Length == 0)
+            throw new InvalidDataException($"Resource configuration has no {ResourceBundleName} bundle.");
         return bundle.ResourcePacks.Distinct(StringComparer.Ordinal).Select(name =>
         {
             ValidatePackName(name);
@@ -64,7 +65,7 @@ internal partial class WuwaGameManager
             try
             {
                 string path = Path.Combine(CurrentGameInstallPath ?? "", "launcherDownloadConfig.json");
-                var bundle = File.Exists(path) ? JsonNode.Parse(File.ReadAllText(path))?["bundles"]?["default"] : null;
+                var bundle = File.Exists(path) ? JsonNode.Parse(File.ReadAllText(path))?["bundles"]?[ResourceBundleName] : null;
                 return bundle == null || bundle["version"]?.GetValue<string>() != packs[0].Value.CurrentVersion.ToString() ||
                     !string.IsNullOrEmpty(bundle["state"]?.GetValue<string>()) ||
                     bundle["resourcePacks"] is not JsonArray names ||
@@ -78,6 +79,11 @@ internal partial class WuwaGameManager
     private void NormalizeResourcePacks()
     {
         if (!UsesResourcePacks) return;
+        var bundles = ApiGameConfigResponse!.Bundles;
+        string path = Path.Combine(CurrentGameInstallPath ?? "", "launcherDownloadConfig.json");
+        var installed = File.Exists(path) ? JsonNode.Parse(File.ReadAllText(path))?["bundles"] as JsonObject : null;
+        ResourceBundleName = installed?.Select(bundle => bundle.Key).FirstOrDefault(name => bundles?.ContainsKey(name) == true)
+            ?? (bundles?.ContainsKey("default") == true ? "default" : "HD");
         ApiGameConfigResponse!.Default = new() { ConfigReference = GetResourcePacks(false)[0].Value };
         if (ApiGameConfigResponse.PredownloadReference?.ResourcePacks is { Count: > 0 })
             ApiGameConfigResponse.PredownloadReference.ConfigReference = GetResourcePacks(true)[0].Value;
@@ -127,12 +133,12 @@ internal partial class WuwaGameManager
         JsonObject root = File.Exists(path) ? JsonNode.Parse(File.ReadAllText(path))!.AsObject() : new();
         var bundles = root["bundles"] as JsonObject ?? new JsonObject();
         if (bundles.Parent == null) root["bundles"] = bundles;
-        var bundle = bundles["default"] as JsonObject ?? new JsonObject();
-        if (bundle.Parent == null) bundles["default"] = bundle;
+        var bundle = bundles[ResourceBundleName] as JsonObject ?? new JsonObject();
+        if (bundle.Parent == null) bundles[ResourceBundleName] = bundle;
         bundle["version"] = packs[0].Value.CurrentVersion.ToString();
         bundle["state"] = "";
         var names = new JsonArray();
-        foreach (var pack in packs) names.Add(pack.Key);
+        foreach (var pack in packs) names.Add((JsonNode?)JsonValue.Create(pack.Key));
         bundle["resourcePacks"] = names;
         root["version"] = packs[0].Value.CurrentVersion.ToString();
         root["state"] = "";

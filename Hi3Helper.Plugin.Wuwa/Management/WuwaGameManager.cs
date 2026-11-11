@@ -55,6 +55,7 @@ internal partial class WuwaGameManager : GameManagerBase
     }
 
     internal string ApiResponseAssetUrl { get; }
+    internal string? GameConfigUrl { get; init; }
     private string GameTag { get; set; }
     private string AuthenticationHash { get; set; }
     private string Hash1 { get; set; }
@@ -172,7 +173,7 @@ internal partial class WuwaGameManager : GameManagerBase
     {
         get
         {
-            bool result = IsInstalled && ApiPreloadGameVersion != GameVersion.Empty && !HasUpdate;
+            bool result = IsInstalled && ApiPreloadGameVersion != GameVersion.Empty && (UsesResourcePacks || !HasUpdate);
             if (_lastHasPreload != result)
             {
                 _lastHasPreload = result;
@@ -342,7 +343,7 @@ internal partial class WuwaGameManager : GameManagerBase
         if (IsOperationContext || (!forceInit && IsInitialized))
             return 0;
 
-        string gameConfigUrl =
+        string gameConfigUrl = GameConfigUrl ??
             $"https://prod-alicdn-gamestarter.kurogame.com/launcher/game/{GameTag.AeonPlsHelpMe()}/" +
             $"{AuthenticationHash.AeonPlsHelpMe()}/index.json";
 
