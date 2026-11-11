@@ -85,15 +85,19 @@ public partial class Exports
 
 					try
 					{
-						await WaitForStartedGameProcessExitAsync(context, process, token);
+						return await WaitForStartedGameProcessExitAsync(context, process, token);
 					}
 					finally
 					{
 						await gameLogReaderCts.CancelAsync();
 						await AwaitCanceledGameLogReaderAsync(gameLogReaderTask, coopCts.Token);
 					}
-					return true;
 				}
+			}
+			catch (Exception e) when (e is not OperationCanceledException || !token.IsCancellationRequested)
+			{
+				InstanceLogger.LogError(e, "[Wuwa::LaunchGameFromGameManagerCoreAsync] Game launch failed.");
+				throw;
 			}
 			finally
 			{
@@ -102,7 +106,7 @@ public partial class Exports
 		}
 	}
 
-	private async Task WaitForStartedGameProcessExitAsync(
+	private async Task<bool> WaitForStartedGameProcessExitAsync(
 		GameManagerExtension.RunGameFromGameManagerContext context,
 		Process startingProcess,
 		CancellationToken token)
@@ -110,7 +114,7 @@ public partial class Exports
 		if (!TryGetGameExecutablePath(context, out string? gameExecutablePath))
 		{
 			await startingProcess.WaitForExitAsync(token);
-			return;
+			return true;
 		}
 
 		const int maxWaitMs = 15000;
@@ -130,11 +134,19 @@ public partial class Exports
 		if (gameProcess != null)
 		{
 			await WaitForGameProcessChainExitAsync(gameExecutablePath, gameProcess, token);
+			return true;
 		}
-		else if (!startingProcess.HasExited)
+
+		if (!startingProcess.HasExited)
 		{
 			await startingProcess.WaitForExitAsync(token);
+			return true;
 		}
+
+		InstanceLogger.LogError(
+			"[Wuwa::WaitForStartedGameProcessExitAsync] {WrapperPath} exited with code {ExitCode}, and {GamePath} was not detected within {WaitMs}ms.",
+			startingProcess.StartInfo.FileName, startingProcess.ExitCode, gameExecutablePath, maxWaitMs);
+		return false;
 	}
 
 	private async Task WaitForGameProcessChainExitAsync(
@@ -419,9 +431,13 @@ public partial class Exports
 		SharedStatic.InstanceLogger.LogInformation(
 			"[Wuwa::TryGetStartingProcessFromContext] Starting executable path: {Path}", startingExecutablePath);
 
-		startArgument = WuwaLaunchArguments.AddResourceTier(Path.GetDirectoryName(startingExecutablePath)!, startArgument);
+		string gameDirectory = Path.GetDirectoryName(startingExecutablePath)!;
+		startArgument = WuwaLaunchArguments.AddResourceTier(gameDirectory, startArgument);
 
-		ProcessStartInfo startInfo = new(startingExecutablePath, startArgument);
+		ProcessStartInfo startInfo = new(startingExecutablePath, startArgument)
+		{
+			WorkingDirectory = gameDirectory
+		};
 
 		process = new Process
 		{
