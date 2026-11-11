@@ -274,6 +274,84 @@ try
         Assert(File.ReadAllText(Path.Combine(dir, "launcherDownloadConfig.json")) == installed, "Preload changed installed bundle metadata");
     });
 
+    foreach (string mode in new[] { "verified", "verified-direct", "corrupt", "missing", "bad-manifest", "missing-hash", "cancelled", "SD" })
+    await Test("legacy pack reconciliation: " + mode, async () =>
+    {
+        string dir = Fresh(), bundleName = mode == "SD" ? "SD" : "HD";
+        byte[] commonPatch = [1, 2, 3], hdPatch = [4, 5, 6, 7];
+        string fullCommon = Manifest("common.bin", data), fullHd = Manifest("hd.bin", data);
+        var legacy = JsonNode.Parse(fullCommon)!;
+        legacy["resource"]!.AsArray().Add(JsonNode.Parse(fullHd)!["resource"]![0]!.DeepClone());
+        if (mode == "missing-hash") legacy["resource"]![1]!.AsObject().Remove("md5");
+        string sourceManifest = legacy.ToJsonString();
+        const string sourceUrl = "https://example.test/legacy/resource/50004/3.7.1/indexFile.json";
+        var stored = new JsonObject
+        {
+            ["version"] = "3.7.1", ["resourceIndexUrl"] = sourceUrl, ["resourceBaseUrl"] = "legacy/zip",
+            ["resourceIndexMd5"] = mode == "bad-manifest" ? new string('0', 32) : Hash(Encoding.UTF8.GetBytes(sourceManifest)),
+            ["DEBUG_skipPreflight"] = true
+        };
+        File.WriteAllText(Path.Combine(dir, "app-game-config.json"), stored.ToJsonString());
+        File.WriteAllBytes(Path.Combine(dir, "common.bin"), data);
+        if (mode != "missing") File.WriteAllBytes(Path.Combine(dir, "hd.bin"), mode == "corrupt" ? new byte[data.Length] : data);
+        string installed = "{\"custom\":42,\"version\":\"3.7.1\",\"bundles\":{\"" + bundleName + "\":{\"version\":\"3.7.0\",\"state\":\"\",\"resourcePacks\":[\"common\",\"hd\"]},\"other\":{\"version\":\"1.0.0\"}}}";
+        File.WriteAllText(Path.Combine(dir, "launcherDownloadConfig.json"), installed);
+        var config = JsonNode.Parse(V2(Pack("common-full.json", fullCommon, "payload", "3.8.0",
+            Pack("common-old.json", fullCommon, "payload", "3.7.0")),
+            Pack("hd-full.json", fullHd, "payload", "3.8.0", Pack("hd-old.json", fullHd, "payload", "3.7.0")), true)
+            .Replace("\"default\":", "\"" + bundleName + "\":")
+            .Replace("\"base\"", "\"common\"").Replace("\"audio\"", "\"hd\""))!;
+        string commonManifest = Manifest("common.krpdiff", commonPatch), hdManifest = Manifest("hd.krpdiff", hdPatch);
+        config["predownload"]!["resourcePacks"]!["common"]!["patchConfig"]!.AsArray().Add(JsonNode.Parse(Pack("common-patch.json", commonManifest, "patch", "3.7.1")));
+        config["predownload"]!["resourcePacks"]!["hd"]!["patchConfig"]!.AsArray().Add(JsonNode.Parse(Pack("hd-patch.json", hdManifest, "patch", "3.7.1")));
+        foreach (var pack in config["resourcePacks"]!.AsObject()) pack.Value!["version"] = "3.7.2";
+        int sourceReads = 0, downloads = 0;
+        using var cancellation = new CancellationTokenSource();
+        using var client = new HttpClient(new Handler(request => request.RequestUri!.AbsolutePath switch
+        {
+            var path when path.EndsWith("/index.json") => Json(config.ToJsonString()),
+            "/legacy/resource/50004/3.7.1/indexFile.json" => Source(),
+            "/common-full.json" or "/common-old.json" => Json(fullCommon),
+            "/hd-full.json" or "/hd-old.json" => Json(fullHd),
+            "/common-patch.json" => Json(commonManifest), "/hd-patch.json" => Json(hdManifest),
+            "/patch/common.krpdiff" => Download(commonPatch), "/patch/hd.krpdiff" => Download(hdPatch),
+            _ => throw new Exception("Unexpected request: " + request.RequestUri)
+        }));
+        HttpResponseMessage Source() { sourceReads++; if (mode == "cancelled") cancellation.Cancel(); return Json(sourceManifest); }
+        HttpResponseMessage Download(byte[] bytes) { downloads++; return Bytes(bytes); }
+        object manager = Manager(client, dir, "3.7.1");
+        Set(manager, "CurrentGameConfigNode", stored);
+        Set(manager, "DEBUG_SkipPreflight", true);
+        foreach (string pack in new[] { "common", "hd" }) Call(manager, managerType, "WritePackVersion", pack, new GameVersion("3.7.0"));
+        object installer = Installer(manager, client);
+        if (mode == "verified-direct") await Run(installer, GameInstallerKind.Preload);
+        else if (mode == "cancelled")
+        {
+            Assert(await Error(() => Invoke(installer, "GetGameSizeAsyncInner", GameInstallerKind.Preload, cancellation.Token)) is OperationCanceledException,
+                "Cancellation did not stop reconciliation");
+        }
+        else
+        {
+            long size = await (Task<long>)Call(installer, installerType, "GetGameSizeAsyncInner", GameInstallerKind.Preload, CancellationToken.None)!;
+            Assert(size == (mode == "verified" ? 7 : data.Length * 2), "Wrong preload manifest selected: " + size);
+        }
+        string expected = mode.StartsWith("verified") ? "3.7.1" : "3.7.0";
+        foreach (string pack in new[] { "common", "hd" })
+            Assert((GameVersion)Call(manager, managerType, "ReadPackVersion", pack)! == new GameVersion(expected), "Unverified pack version promoted");
+        var root = JsonNode.Parse(File.ReadAllText(Path.Combine(dir, "launcherDownloadConfig.json")))!;
+        Assert((string?)root["version"] == "3.7.1" && (string?)root["bundles"]![bundleName]!["version"] == expected &&
+            (int?)root["custom"] == 42 && (string?)root["bundles"]!["other"]!["version"] == "1.0.0", "Bundle reconciliation lost metadata");
+        if (mode.StartsWith("verified"))
+        {
+            await Run(installer, GameInstallerKind.Preload);
+            long downloaded = await (Task<long>)Call(installer, installerType, "GetGameDownloadedSizeAsyncInner", GameInstallerKind.Preload, CancellationToken.None)!;
+            Assert(downloads == 2 && downloaded == 7 && sourceReads == 1, "Preload did not reuse the reconciled source version");
+            Assert(File.ReadAllBytes(Path.Combine(dir, "common.bin")).SequenceEqual(data) && File.ReadAllBytes(Path.Combine(dir, "hd.bin")).SequenceEqual(data), "Preload changed installed files");
+            Assert(File.ReadAllText(Path.Combine(dir, "app-game-config.json")) == stored.ToJsonString(), "Reconciliation rewrote the main version");
+        }
+        else Assert(downloads == 0, "Verification downloaded a payload");
+    });
+
     await Test("V2 second-pack failure preserves completed pack and bundle version", async () =>
     {
         string dir = Fresh(), first = Manifest("base.bin", data), second = Manifest("audio.bin", data);

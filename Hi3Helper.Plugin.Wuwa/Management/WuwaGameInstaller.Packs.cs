@@ -39,6 +39,8 @@ internal partial class WuwaGameInstaller
     {
         if (kind == GameInstallerKind.None) return 0;
         var manager = (WuwaGameManager)GameManager;
+        if (kind is GameInstallerKind.Update or GameInstallerKind.Preload)
+            await manager.TryReconcileLegacyResourcePacksAsync(this, token).ConfigureAwait(false);
         long total = 0;
         foreach (var pack in manager.GetResourcePacks(kind == GameInstallerKind.Preload))
         {
@@ -75,6 +77,8 @@ internal partial class WuwaGameInstaller
         InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
     {
         var manager = (WuwaGameManager)GameManager;
+        if (kind is GameInstallerKind.Update or GameInstallerKind.Preload)
+            await manager.TryReconcileLegacyResourcePacksAsync(this, token).ConfigureAwait(false);
         // Snapshot the selected targets once. Each operation context remains pinned to
         // its pack/version even if the root manager refreshes its API response later.
         var packs = manager.GetResourcePacks(kind == GameInstallerKind.Preload);

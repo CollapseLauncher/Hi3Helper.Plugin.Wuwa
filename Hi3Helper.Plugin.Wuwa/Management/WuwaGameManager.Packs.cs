@@ -1,11 +1,16 @@
+using Hi3Helper.Plugin.Core;
 using Hi3Helper.Plugin.Core.Management;
 using Hi3Helper.Plugin.Wuwa.Management.Api;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Hi3Helper.Plugin.Wuwa.Management;
 
@@ -87,6 +92,58 @@ internal partial class WuwaGameManager
         ApiGameConfigResponse!.Default = new() { ConfigReference = GetResourcePacks(false)[0].Value };
         if (ApiGameConfigResponse.PredownloadReference?.ResourcePacks is { Count: > 0 })
             ApiGameConfigResponse.PredownloadReference.ConfigReference = GetResourcePacks(true)[0].Value;
+    }
+
+    internal async Task TryReconcileLegacyResourcePacksAsync(WuwaGameInstaller installer, CancellationToken token)
+    {
+        GameVersion version = CurrentGameVersion;
+        string? installPath = CurrentGameInstallPath;
+        // The legacy global manifest describes the complete HD install, not SD/UHD.
+        if (DEBUG_AllowDowngrade || ResourceBundleName != "HD" || version == GameVersion.Empty ||
+            !TryGetInstalledVersionResourceUrls(out var urls) ||
+            !urls.IndexUrl.EndsWith($"/resource/50004/{version}/indexFile.json", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrEmpty(GetManifestMd5(urls.IndexUrl))) return;
+
+        var packs = GetResourcePacks(false);
+        if (!new HashSet<string>(packs.Select(pack => pack.Key), StringComparer.Ordinal).SetEquals(["common", "hd"]) ||
+            packs.Any(pack => ReadPackVersion(pack.Key) > version) ||
+            packs.All(pack => ReadPackVersion(pack.Key) == version)) return;
+
+        try
+        {
+            string path = Path.Combine(installPath!, "launcherDownloadConfig.json");
+            var root = JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+            if (root["bundles"]?[ResourceBundleName] is not JsonObject bundle) return;
+
+            var index = await installer.FetchResourceIndexAsync(urls.IndexUrl, token).ConfigureAwait(false);
+            if (index?.Resource is not { Length: > 0 } ||
+                index.Resource.Any(entry => string.IsNullOrEmpty(entry.Dest) || string.IsNullOrEmpty(entry.Md5))) return;
+
+            SharedStatic.InstanceLogger.LogInformation(
+                "[WuwaGameManager::TryReconcileLegacyResourcePacksAsync] Verifying {Count} installed files against legacy version {Version} before correcting pack records.",
+                index.Resource.Length, version);
+            foreach (var entry in index.Resource)
+            {
+                if (await WuwaFileIntegrity.MatchesAsync(Path.Combine(installPath!, entry.Dest!.Replace('/', Path.DirectorySeparatorChar)),
+                        entry.Size, entry.Md5, token).ConfigureAwait(false)) continue;
+                SharedStatic.InstanceLogger.LogWarning(
+                    "[WuwaGameManager::TryReconcileLegacyResourcePacksAsync] Installed file differs from legacy manifest: {File}. Keeping pack records unchanged.", entry.Dest);
+                return;
+            }
+
+            token.ThrowIfCancellationRequested();
+            if (CurrentGameVersion != version || CurrentGameInstallPath != installPath) return;
+            foreach (var pack in packs) WritePackVersion(pack.Key, version);
+            bundle["version"] = version.ToString();
+            WriteJsonAtomic(path, root);
+            SharedStatic.InstanceLogger.LogInformation(
+                "[WuwaGameManager::TryReconcileLegacyResourcePacksAsync] Verified legacy install. Corrected Common/HD pack records to {Version}.", version);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidDataException or JsonException)
+        {
+            SharedStatic.InstanceLogger.LogWarning(
+                "[WuwaGameManager::TryReconcileLegacyResourcePacksAsync] Could not verify legacy install; retaining existing pack versions: {Error}", ex.Message);
+        }
     }
 
     internal WuwaGameManager CreateOperationContext(WuwaApiResponseGameConfigRef target, GameVersion currentVersion, bool preload)
