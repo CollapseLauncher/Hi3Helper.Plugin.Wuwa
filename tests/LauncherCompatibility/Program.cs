@@ -324,16 +324,21 @@ try
         Set(manager, "DEBUG_SkipPreflight", true);
         foreach (string pack in new[] { "common", "hd" }) Call(manager, managerType, "WritePackVersion", pack, new GameVersion("3.7.0"));
         object installer = Installer(manager, client);
-        if (mode == "verified-direct") await Run(installer, GameInstallerKind.Preload);
-        else if (mode == "cancelled")
-        {
-            Assert(await Error(() => Invoke(installer, "GetGameSizeAsyncInner", GameInstallerKind.Preload, cancellation.Token)) is OperationCanceledException,
-                "Cancellation did not stop reconciliation");
-        }
-        else
+        if (mode != "verified-direct")
         {
             long size = await (Task<long>)Call(installer, installerType, "GetGameSizeAsyncInner", GameInstallerKind.Preload, CancellationToken.None)!;
-            Assert(size == (mode == "verified" ? 7 : data.Length * 2), "Wrong preload manifest selected: " + size);
+            long downloaded = await (Task<long>)Call(installer, installerType, "GetGameDownloadedSizeAsyncInner", GameInstallerKind.Preload, CancellationToken.None)!;
+            Assert(size == (mode == "SD" ? data.Length * 2 : 7) && downloaded == 0, "Wrong preload estimate: " + size);
+            Assert(sourceReads == 0 && File.ReadAllText(Path.Combine(dir, "launcherDownloadConfig.json")) == installed,
+                "Preload availability checked installed hashes or changed version records");
+            foreach (string pack in new[] { "common", "hd" })
+                Assert((GameVersion)Call(manager, managerType, "ReadPackVersion", pack)! == new GameVersion("3.7.0"), "Size query promoted a pack");
+        }
+        if (mode != "SD")
+        {
+            var error = await Error(() => Run(installer, GameInstallerKind.Preload, cancellation.Token));
+            Assert(mode.StartsWith("verified") ? error == null : mode == "cancelled" ? error is OperationCanceledException : error is InvalidDataException,
+                "Preload did not enforce source verification: " + error);
         }
         string expected = mode.StartsWith("verified") ? "3.7.1" : "3.7.0";
         foreach (string pack in new[] { "common", "hd" })
@@ -350,6 +355,66 @@ try
             Assert(File.ReadAllText(Path.Combine(dir, "app-game-config.json")) == stored.ToJsonString(), "Reconciliation rewrote the main version");
         }
         else Assert(downloads == 0, "Verification downloaded a payload");
+    });
+
+    foreach (string change in new[] { "unchanged", "corrupt", "truncated", "deleted", "manifest", "partial" })
+    await Test("preload status uses metadata: " + change, async () =>
+    {
+        string dir = Fresh();
+        byte[] basePayload = data;
+        string first = Manifest("base.bin", basePayload), second = Manifest("audio.bin", data);
+        string config = V2(Pack("base.json", first), Pack("audio.json", second), true);
+        int downloads = 0;
+        using var client = new HttpClient(new Handler(request => request.RequestUri!.AbsolutePath switch
+        {
+            var path when path.EndsWith("/index.json") => Json(config),
+            "/base.json" => Json(first), "/audio.json" => Json(second),
+            "/base/base.bin" => Download(basePayload), "/base/audio.bin" => Download(data),
+            _ => throw new Exception("Unexpected request: " + request.RequestUri)
+        }));
+        HttpResponseMessage Download(byte[] bytes) { downloads++; return Bytes(bytes); }
+        object FreshInstaller() => Installer(Manager(client, dir), client);
+        async Task<long> Downloaded() => await (Task<long>)Call(FreshInstaller(), installerType,
+            "GetGameDownloadedSizeAsyncInner", GameInstallerKind.Preload, CancellationToken.None)!;
+        await Run(FreshInstaller(), GameInstallerKind.Preload);
+        string file = Path.Combine(dir, "launcherDownload", "base", "3.7.0", "base.bin");
+        string marker = Path.Combine(Path.GetDirectoryName(file)!, ".version");
+        File.WriteAllText(marker, "3.7.0");
+        // An exclusive read handle permits metadata checks but prevents a second
+        // content read. A new installer also rules out an instance-only cache.
+        using (var held = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.None))
+            Assert(await Downloaded() == data.Length * 2, "Status query read preload contents on a cold check");
+
+        if (change == "corrupt")
+        {
+            File.WriteAllBytes(file, new byte[data.Length]);
+            File.SetLastWriteTimeUtc(file, DateTime.UtcNow.AddSeconds(5));
+        }
+        if (change == "truncated") File.WriteAllBytes(file, data[..^1]);
+        if (change == "deleted") File.Delete(file);
+        if (change == "manifest")
+        {
+            basePayload = data.Reverse().ToArray();
+            first = Manifest("base.bin", basePayload);
+            config = V2(Pack("base.json", first), Pack("audio.json", second), true);
+        }
+        if (change == "partial")
+        {
+            File.Delete(file);
+            File.WriteAllBytes(file + ".tmp", data[..5]);
+        }
+        long expected = change is "truncated" or "deleted" ? data.Length : change == "partial" ? data.Length + 5 : data.Length * 2;
+        Assert(await Downloaded() == expected, "Downloaded byte count did not match cached file metadata");
+        if (change == "corrupt")
+        {
+            await Run(FreshInstaller(), GameInstallerKind.Update);
+            Assert(downloads == 3 && File.ReadAllBytes(Path.Combine(dir, "base.bin")).SequenceEqual(basePayload),
+                "Installation trusted the fast status check instead of verifying cached content");
+            return;
+        }
+        await Run(FreshInstaller(), GameInstallerKind.Preload);
+        Assert(downloads == (change == "unchanged" ? 2 : 3), "Preload repair discarded a good cached pack");
+        Assert(await Downloaded() == data.Length * 2, "Repaired preload was not complete");
     });
 
     await Test("V2 second-pack failure preserves completed pack and bundle version", async () =>

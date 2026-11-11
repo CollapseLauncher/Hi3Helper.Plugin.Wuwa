@@ -94,20 +94,28 @@ internal partial class WuwaGameManager
             ApiGameConfigResponse.PredownloadReference.ConfigReference = GetResourcePacks(true)[0].Value;
     }
 
-    internal async Task TryReconcileLegacyResourcePacksAsync(WuwaGameInstaller installer, CancellationToken token)
+    internal bool TryGetLegacyResourcePackVersion(out GameVersion version, out VersionResourceUrls urls)
     {
-        GameVersion version = CurrentGameVersion;
-        string? installPath = CurrentGameInstallPath;
+        GameVersion candidate = CurrentGameVersion;
+        version = candidate;
+        urls = default;
         // The legacy global manifest describes the complete HD install, not SD/UHD.
-        if (DEBUG_AllowDowngrade || ResourceBundleName != "HD" || version == GameVersion.Empty ||
-            !TryGetInstalledVersionResourceUrls(out var urls) ||
-            !urls.IndexUrl.EndsWith($"/resource/50004/{version}/indexFile.json", StringComparison.OrdinalIgnoreCase) ||
-            string.IsNullOrEmpty(GetManifestMd5(urls.IndexUrl))) return;
+        if (DEBUG_AllowDowngrade || ResourceBundleName != "HD" || candidate == GameVersion.Empty ||
+            !TryGetInstalledVersionResourceUrls(out urls) ||
+            !urls.IndexUrl.EndsWith($"/resource/50004/{candidate}/indexFile.json", StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrEmpty(GetManifestMd5(urls.IndexUrl))) return false;
 
         var packs = GetResourcePacks(false);
-        if (!new HashSet<string>(packs.Select(pack => pack.Key), StringComparer.Ordinal).SetEquals(["common", "hd"]) ||
-            packs.Any(pack => ReadPackVersion(pack.Key) > version) ||
-            packs.All(pack => ReadPackVersion(pack.Key) == version)) return;
+        return new HashSet<string>(packs.Select(pack => pack.Key), StringComparer.Ordinal).SetEquals(["common", "hd"]) &&
+            !packs.Any(pack => ReadPackVersion(pack.Key) > candidate) &&
+            packs.Any(pack => ReadPackVersion(pack.Key) != candidate);
+    }
+
+    internal async Task TryReconcileLegacyResourcePacksAsync(WuwaGameInstaller installer, CancellationToken token)
+    {
+        if (!TryGetLegacyResourcePackVersion(out var version, out var urls)) return;
+        string? installPath = CurrentGameInstallPath;
+        var packs = GetResourcePacks(false);
 
         try
         {

@@ -26,31 +26,42 @@ internal partial class WuwaGameInstaller
         Path.Combine(installPath, "TempPath", patch ? PatchTempDirName : "TempGameFiles");
 
     private WuwaGameInstaller CreatePackInstaller(WuwaGameManager manager, string name,
-        WuwaApiResponseGameConfigRef target, bool preload)
+        WuwaApiResponseGameConfigRef target, bool preload, GameVersion currentVersion)
     {
-        var context = manager.CreateOperationContext(target, manager.ReadPackVersion(name), preload);
+        var context = manager.CreateOperationContext(target, currentVersion, preload);
         return new WuwaGameInstaller(context, _downloadHttpClient)
         {
             _operationCachePath = Path.Combine(EnsureAndGetGamePath(), "launcherDownload", name, target.CurrentVersion.ToString())
         };
     }
 
+    private static GameVersion? GetLegacyPackSourceVersion(WuwaGameManager manager,
+        KeyValuePair<string, WuwaApiResponseGameConfigRef>[] packs) =>
+        manager.TryGetLegacyResourcePackVersion(out var version, out _) &&
+        packs.All(pack => pack.Value.PatchConfig?.Any(patch => patch.CurrentVersion == version) == true)
+            ? version : null;
+
     private async Task<long> GetResourcePackSizeAsync(GameInstallerKind kind, bool downloaded, CancellationToken token)
     {
         if (kind == GameInstallerKind.None) return 0;
         var manager = (WuwaGameManager)GameManager;
-        if (kind is GameInstallerKind.Update or GameInstallerKind.Preload)
+        if (kind == GameInstallerKind.Update)
             await manager.TryReconcileLegacyResourcePacksAsync(this, token).ConfigureAwait(false);
+        var packs = manager.GetResourcePacks(kind == GameInstallerKind.Preload);
+        // Collapse asks for these sizes before showing the preload button. Plan from
+        // saved metadata here; verify the installed sources only when starting work.
+        var legacyVersion = kind == GameInstallerKind.Preload ? GetLegacyPackSourceVersion(manager, packs) : null;
         long total = 0;
-        foreach (var pack in manager.GetResourcePacks(kind == GameInstallerKind.Preload))
+        foreach (var pack in packs)
         {
-            if (kind != GameInstallerKind.Install && manager.ReadPackVersion(pack.Key) == pack.Value.CurrentVersion)
+            GameVersion currentVersion = legacyVersion ?? manager.ReadPackVersion(pack.Key);
+            if (kind != GameInstallerKind.Install && currentVersion == pack.Value.CurrentVersion)
                 continue;
-            var installer = CreatePackInstaller(manager, pack.Key, pack.Value, kind == GameInstallerKind.Preload);
+            var installer = CreatePackInstaller(manager, pack.Key, pack.Value, kind == GameInstallerKind.Preload, currentVersion);
             try
             {
                 var patch = kind == GameInstallerKind.Install ? null :
-                    pack.Value.PatchConfig?.FirstOrDefault(p => p.CurrentVersion == manager.ReadPackVersion(pack.Key));
+                    pack.Value.PatchConfig?.FirstOrDefault(p => p.CurrentVersion == currentVersion);
                 WuwaApiResponseResourceEntry[] entries = patch == null
                     ? (await installer.GetCachedIndexAsync(false, token).ConfigureAwait(false)
                        ?? throw new InvalidDataException($"Missing pack manifest: {pack.Key}")).Resource
@@ -62,7 +73,14 @@ internal partial class WuwaGameInstaller
                     long size = checked((long)entry.Size);
                     if (!downloaded) { total = checked(total + size); continue; }
                     string path = Path.Combine(installer._operationCachePath!, entry.Dest.Replace('/', Path.DirectorySeparatorChar));
-                    if (await WuwaFileIntegrity.MatchesAsync(path, entry.Size, entry.Md5, token).ConfigureAwait(false))
+                    token.ThrowIfCancellationRequested();
+                    var file = new FileInfo(path);
+                    // Status reports downloaded bytes. Content is verified when
+                    // downloading/resuming or applying, not when opening the box.
+                    bool present = kind == GameInstallerKind.Preload
+                        ? file.Exists && file.Length == size
+                        : await WuwaFileIntegrity.MatchesAsync(path, entry.Size, entry.Md5, token).ConfigureAwait(false);
+                    if (present)
                         total = checked(total + size);
                     else if (File.Exists(path + ".tmp"))
                         total = checked(total + Math.Min(size, new FileInfo(path + ".tmp").Length));
@@ -77,11 +95,19 @@ internal partial class WuwaGameInstaller
         InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
     {
         var manager = (WuwaGameManager)GameManager;
-        if (kind is GameInstallerKind.Update or GameInstallerKind.Preload)
+        if (kind == GameInstallerKind.Update)
             await manager.TryReconcileLegacyResourcePacksAsync(this, token).ConfigureAwait(false);
         // Snapshot the selected targets once. Each operation context remains pinned to
         // its pack/version even if the root manager refreshes its API response later.
         var packs = manager.GetResourcePacks(kind == GameInstallerKind.Preload);
+        var legacyVersion = kind == GameInstallerKind.Preload ? GetLegacyPackSourceVersion(manager, packs) : null;
+        if (legacyVersion is { } sourceVersion)
+        {
+            progressStateDelegate?.Invoke(InstallProgressState.Verify);
+            await manager.TryReconcileLegacyResourcePacksAsync(this, token).ConfigureAwait(false);
+            if (packs.Any(pack => manager.ReadPackVersion(pack.Key) != sourceVersion))
+                throw new InvalidDataException("The installed game could not be verified against its saved version. Repair or update the game before retrying the preload.");
+        }
         string installPath = EnsureAndGetGamePath();
         var operations = new List<(string Name, WuwaApiResponseGameConfigRef Target, WuwaGameInstaller Installer,
             WuwaApiResponseResourceIndex Index)>();
@@ -90,7 +116,7 @@ internal partial class WuwaGameInstaller
             var retained = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var pack in packs)
             {
-                var installer = CreatePackInstaller(manager, pack.Key, pack.Value, kind == GameInstallerKind.Preload);
+                var installer = CreatePackInstaller(manager, pack.Key, pack.Value, kind == GameInstallerKind.Preload, manager.ReadPackVersion(pack.Key));
                 var index = await installer.GetCachedIndexAsync(false, token).ConfigureAwait(false)
                     ?? throw new InvalidDataException($"Missing pack manifest: {pack.Key}");
                 operations.Add((pack.Key, pack.Value, installer, index));
