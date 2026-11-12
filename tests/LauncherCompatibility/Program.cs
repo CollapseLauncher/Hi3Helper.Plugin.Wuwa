@@ -4,8 +4,11 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Hi3Helper.Plugin.Core;
 using Hi3Helper.Plugin.Core.Management;
+using Hi3Helper.Plugin.Core.Management.Api;
 using Hi3Helper.Plugin.Wuwa.Management.Api;
+using Hi3Helper.Plugin.Wuwa.Management.PresetConfig;
 
 // Exercise the production manager/installer. Only HTTP responses and game files are fixtures.
 var assembly = typeof(WuwaApiResponseContext).Assembly;
@@ -51,6 +54,7 @@ object? Call(object? instance, Type type, string method, params object?[] argume
     catch (TargetInvocationException ex) { System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException!).Throw(); throw; }
 }
 Task Invoke(object instance, string method, params object?[] arguments) => (Task)Call(instance, instance.GetType(), method, arguments)!;
+Task InitMedia(LauncherApiMediaBase media) => (Task)media.GetType().GetMethod("InitAsync", flags | BindingFlags.DeclaredOnly)!.Invoke(media, [CancellationToken.None])!;
 async Task<Exception?> Error(Func<Task> action) { try { await action(); return null; } catch (Exception ex) { return ex; } }
 async Task Test(string name, Func<Task> action)
 {
@@ -78,6 +82,56 @@ Task Run(object installer, GameInstallerKind kind, CancellationToken token = def
     : Invoke(installer, "StartPatchCoreAsync", kind, kind == GameInstallerKind.Preload, null, null, token);
 try
 {
+    await Test("media uses current game config and rotating background hash", async () =>
+    {
+        const string gameUrl = "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/50004_P7xcUZnEr1AXIGON25E6KjpOgTlVrg6e/G153/official/";
+        int revision = 0;
+        var requests = new List<string>();
+        using var client = new HttpClient(new Handler(request =>
+        {
+            string url = request.RequestUri!.AbsoluteUri;
+            requests.Add(url);
+            if (url == gameUrl + "index.json")
+                return Json(JsonSerializer.Serialize(new { config = new { functionCode = new { background = $"revision-{revision}" } } }));
+            if (url == gameUrl + $"background/revision-{revision}/en.json")
+                return Json(JsonSerializer.Serialize(new
+                {
+                    functionSwitch = 1, backgroundFileType = revision == 0 ? 2 : 1,
+                    backgroundFile = $"https://assets.test/background-{revision}." + (revision == 0 ? "mp4" : "webp"),
+                    firstFrameImage = "https://assets.test/preview.webp", slogan = "https://assets.test/slogan.png"
+                }));
+            throw new Exception("Unexpected media request: " + url);
+        }));
+        var media = (LauncherApiMediaBase)new WuwaGlobalPresetConfig().LauncherApiMedia!;
+        Set(media, "ApiResponseHttpClient", client);
+        for (; revision < 2; revision++)
+        {
+            await InitMedia(media);
+            using var backgrounds = PluginDisposableMemoryExtension.ToManagedSpan<LauncherPathEntry>(media.GetBackgroundEntries);
+            Assert(backgrounds.Length == 1, "Expected one background");
+            using LauncherPathEntry background = backgrounds[0];
+            Assert(background.Path == $"https://assets.test/background-{revision}." + (revision == 0 ? "mp4" : "webp"), "Background did not refresh");
+            media.GetBackgroundFlag(out var kind);
+            Assert(kind == (revision == 0 ? LauncherBackgroundFlag.TypeIsVideo : LauncherBackgroundFlag.TypeIsImage), "Wrong media type");
+            using var logos = PluginDisposableMemoryExtension.ToManagedSpan<LauncherPathEntry>(media.GetLogoOverlayEntries);
+            using LauncherPathEntry logo = logos[0];
+            Assert(logo.Path == "https://assets.test/slogan.png", "Slogan lost");
+        }
+        Assert(requests.Count == 4, "Each refresh must fetch config and wallpaper");
+        media.Dispose();
+    });
+
+    await Test("media rejects missing background hash", async () =>
+    {
+        int requests = 0;
+        using var client = new HttpClient(new Handler(_ => { requests++; return Json("{\"config\":{}}"); }));
+        var media = (LauncherApiMediaBase)new WuwaGlobalPresetConfig().LauncherApiMedia!;
+        Set(media, "ApiResponseHttpClient", client);
+        Assert(await Error(() => InitMedia(media)) is InvalidOperationException && requests == 1,
+            "Missing hash must fail before requesting wallpaper");
+        media.Dispose();
+    });
+
     await Test("preserve bundles and unknown launcher fields", () =>
     {
         string dir = Fresh(), path = Path.Combine(dir, "launcherDownloadConfig.json");

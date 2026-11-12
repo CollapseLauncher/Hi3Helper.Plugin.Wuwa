@@ -98,7 +98,7 @@ public partial class WuwaGlobalPresetConfig : WuwaPresetConfig
 
     public override ILauncherApiMedia? LauncherApiMedia
     {
-        get => field ??= new WuwaGlobalLauncherApiMedia(ApiResponseUrl, CurrentTag, AuthenticationHash);
+        get => field ??= new WuwaGlobalLauncherApiMedia(ApiResponseUrl, GlobalGameConfigUrl);
         set;
     }
 

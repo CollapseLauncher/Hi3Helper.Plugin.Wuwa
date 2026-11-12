@@ -21,7 +21,7 @@ using Microsoft.Extensions.Logging;
 namespace Hi3Helper.Plugin.Wuwa.Management.Api;
 
 [GeneratedComClass]
-internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, string gameTag, string authenticationHash) : LauncherApiMediaBase
+internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, string gameConfigUrl) : LauncherApiMediaBase
 {
     [field: AllowNull, MaybeNull]
     protected override HttpClient ApiResponseHttpClient
@@ -113,37 +113,32 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
 
     protected override async Task<int> InitAsync(CancellationToken token)
     {
-        string decodedAuthHash = authenticationHash.AeonPlsHelpMe();
-        string decodedGameTag  = gameTag.AeonPlsHelpMe();
-
-        // Step 1 — fetch the stable launcher-config endpoint to resolve the current (rotating) background hash.
-        // URL: {CDN}/launcher/launcher/{clientId}/{gameId}/index.json
-        string launcherConfigUrl = ApiResponseBaseUrl
-            .CombineUrlFromString("launcher", "launcher", decodedAuthHash, decodedGameTag, "index.json");
+        // Step 1 — fetch the game-config endpoint to resolve the current (rotating) background hash.
+        // URL: {CDN}/launcher/game/{clientId}/{gameId}/{serverCode}/index.json
 
 #if DEBUG
         SharedStatic.InstanceLogger.LogDebug(
-            "[WuwaGlobalLauncherApiMedia::InitAsync] Fetching launcher-config: {Url}", launcherConfigUrl);
+            "[WuwaGlobalLauncherApiMedia::InitAsync] Fetching game-config: {Url}", gameConfigUrl);
 #endif
 
-        using HttpResponseMessage configResponse = await ApiResponseHttpClient!.GetAsync(launcherConfigUrl, token);
+        using HttpResponseMessage configResponse = await ApiResponseHttpClient!.GetAsync(gameConfigUrl, token);
         if (!configResponse.IsSuccessStatusCode)
         {
             SharedStatic.InstanceLogger.LogError(
-                "[WuwaGlobalLauncherApiMedia::InitAsync] launcher-config request failed: {StatusCode}", (int)configResponse.StatusCode);
+                "[WuwaGlobalLauncherApiMedia::InitAsync] game-config request failed: {StatusCode}", (int)configResponse.StatusCode);
         }
         configResponse.EnsureSuccessStatusCode();
 
         string configJson = await configResponse.Content.ReadAsStringAsync(token);
-        SharedStatic.InstanceLogger.LogTrace("[WuwaGlobalLauncherApiMedia::InitAsync] Launcher-config response: {Json}", configJson);
+        SharedStatic.InstanceLogger.LogTrace("[WuwaGlobalLauncherApiMedia::InitAsync] Game-config response: {Json}", configJson);
 
         WuwaApiResponseLauncherConfig? launcherConfig = JsonSerializer.Deserialize(
             configJson, WuwaApiResponseContext.Default.WuwaApiResponseLauncherConfig);
 
-        string? backgroundHash = launcherConfig?.FunctionCode?.Background;
+        string? backgroundHash = launcherConfig?.Config?.FunctionCode?.Background;
         if (string.IsNullOrEmpty(backgroundHash))
             throw new InvalidOperationException(
-                "launcher-config response did not contain a valid functionCode.background hash.");
+                "game-config response did not contain a valid config.functionCode.background hash.");
 
 #if DEBUG
         SharedStatic.InstanceLogger.LogDebug(
@@ -151,9 +146,9 @@ internal partial class WuwaGlobalLauncherApiMedia(string apiResponseBaseUrl, str
 #endif
 
         // Step 2 — fetch the wallpapers-slogan endpoint using the dynamic hash.
-        // URL: {CDN}/launcher/{clientId}/{gameId}/background/{hash}/en.json
-        string wallpaperUrl = ApiResponseBaseUrl
-            .CombineUrlFromString("launcher", decodedAuthHash, decodedGameTag, "background", backgroundHash, "en.json");
+        // URL: {CDN}/launcher/game/{clientId}/{gameId}/{serverCode}/background/{hash}/en.json
+        string wallpaperUrl = new Uri(new Uri(gameConfigUrl), ".").AbsoluteUri
+            .CombineUrlFromString("background", backgroundHash, "en.json");
 
 #if DEBUG
         SharedStatic.InstanceLogger.LogDebug(
