@@ -10,9 +10,11 @@ try
     Check("sd-only", null, "-krqlv=sd", "SD");
     Check("uhd-only", "-dx12", "-krqlv=uhd -dx12", "UHD");
     Check("hd-only", null, "-krqlv=hd", "HD");
-    CheckAmbiguous("multiple", "SD", "UHD", "HD");
-    CheckAmbiguous("without-hd", "SD", "UHD");
-    CheckAmbiguous("unknown");
+    Check("multiple", null, "-krqlv=uhd", "SD", "UHD", "HD");
+    Check("without-hd", null, "-krqlv=uhd", "SD", "UHD");
+    Check("uhd-hd", "-dx12", "-krqlv=uhd -dx12", "HD", "UHD");
+    Check("hd-sd", null, "-krqlv=hd", "SD", "HD");
+    CheckUnknown("unknown");
     Check("explicit", "-krqlv=uhd -dx12", "-krqlv=uhd -dx12", "HD");
     Check("explicit-case", "-KRQLV=SD", "-KRQLV=SD", "HD");
 
@@ -23,7 +25,7 @@ try
     Directory.CreateDirectory(Path.Combine(root, "unrelated-pak", "Client", "Content", "HD"));
     File.WriteAllText(Path.Combine(root, "unrelated-pak", "Client", "Content", "HD", "unrelated.pak"), "package");
     Check("unrelated-pak", null, "-krqlv=sd", "SD");
-    Check("explicit-multiple", "-krqlv=sd", "-krqlv=sd", "SD", "HD");
+    Check("explicit-multiple", "-krqlv=sd", "-krqlv=sd", "SD", "HD", "UHD");
     Check("explicit-unknown", "-krqlv=uhd", "-krqlv=uhd");
     Console.WriteLine("All launch argument checks passed.");
 }
@@ -32,15 +34,9 @@ finally
     Directory.Delete(root, true);
 }
 
-void CheckAmbiguous(string name, params string[] tiers)
+void CheckUnknown(string name)
 {
     string gamePath = Path.Combine(root, name);
-    foreach (string tier in tiers)
-    {
-        string directory = Path.Combine(gamePath, "Client", "Content", tier);
-        Directory.CreateDirectory(directory);
-        File.WriteAllText(Path.Combine(directory, $"pakchunk1-{tier}-WindowsNoEditor.pak"), "package");
-    }
 
     try
     {
@@ -50,7 +46,7 @@ void CheckAmbiguous(string name, params string[] tiers)
     {
         return;
     }
-    throw new Exception($"{name}: expected an unidentified or ambiguous tier error.");
+    throw new Exception($"{name}: expected an unidentified tier error.");
 }
 
 void Check(string name, string? arguments, string expected, params string[] tiers)

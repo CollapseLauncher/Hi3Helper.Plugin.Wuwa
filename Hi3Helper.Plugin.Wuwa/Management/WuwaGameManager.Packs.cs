@@ -81,6 +81,18 @@ internal partial class WuwaGameManager
         }
     }
 
+    private void TrySyncInstalledResourceBundleVersion()
+    {
+        if (DEBUG_AllowDowngrade || !IsInstalled || CurrentGameVersion >= ApiGameVersion || HasResourcePackUpdate)
+            return;
+
+        SharedStatic.InstanceLogger.LogInformation(
+            "[WuwaGameManager::TrySyncInstalledResourceBundleVersion] Installed {Bundle} bundle and resource packs are current. Syncing local version from {LocalVersion} to {ApiVersion} after an external update.",
+            ResourceBundleName, CurrentGameVersion, ApiGameVersion);
+        CurrentGameVersion = ApiGameVersion;
+        SaveConfig();
+    }
+
     private void NormalizeResourcePacks()
     {
         if (!UsesResourcePacks) return;

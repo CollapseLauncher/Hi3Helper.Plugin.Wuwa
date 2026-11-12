@@ -223,6 +223,56 @@ try
         Assert(downloads == 2, "Completed packs redownloaded");
     });
 
+    foreach (string mode in new[] { "complete", "stale-pack", "missing-pack", "incomplete-bundle", "downgrade" })
+    foreach (bool locateAfterInit in new[] { false, true })
+    await Test("official UHD update sync " + mode + ", locate after init=" + locateAfterInit, async () =>
+    {
+        string dir = Fresh(), manifest = Manifest("payload.bin", data);
+        string config = V2(Pack("current.json", manifest), Pack("current.json", manifest))
+            .Replace("\"default\":", "\"UHD\":");
+        var apiConfig = JsonNode.Parse(config)!;
+        apiConfig["bundles"]!["HD"] = new JsonObject { ["resourcePacks"] = new JsonArray("hd") };
+        apiConfig["resourcePacks"]!["hd"] = JsonNode.Parse(Pack("hd.json", manifest));
+        config = apiConfig.ToJsonString();
+        foreach (string file in new[] { "Client/Binaries/Win64/Client-Win64-ShippingBase.dll",
+                     "Client/Binaries/Win64/Client-Win64-Shipping.exe",
+                     "Client/Binaries/Win64/ThirdParty/KrPcSdk_Global/KRSDKRes/KRSDK.bin", "app-game-config.json" })
+        {
+            string path = Path.Combine(dir, file);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, file.EndsWith(".json") ? "{\"version\":\"3.6.1\"}" : "installed");
+        }
+        var installed = JsonNode.Parse("""{"version":"3.6.1","bundles":{"UHD":{"version":"3.7.0","state":"","resourcePacks":["base","audio"]}}}""")!;
+        if (mode == "incomplete-bundle") installed["bundles"]!["UHD"]!["state"] = "repairing";
+        File.WriteAllText(Path.Combine(dir, "launcherDownloadConfig.json"), installed.ToJsonString());
+        using var client = new HttpClient(new Handler(request => request.RequestUri!.AbsolutePath.EndsWith("/index.json")
+            ? Json(config) : throw new Exception("Unexpected request: " + request.RequestUri)));
+        object manager = Manager(client, dir);
+        foreach (string pack in new[] { "base", "audio" })
+        {
+            if (mode == "missing-pack" && pack == "audio") continue;
+            Call(manager, managerType, "WritePackVersion", pack,
+                new GameVersion(mode == "stale-pack" && pack == "audio" ? "3.6.1" : "3.7.0"));
+        }
+        if (mode == "downgrade")
+        {
+            Set(manager, "DEBUG_AllowDowngrade", true);
+            File.WriteAllText(Path.Combine(dir, "app-game-config.json"), """{"version":"3.6.1","DEBUG_allowDowngrade":true}""");
+        }
+        if (locateAfterInit) ((IGameManager)manager).SetGamePath("");
+        await Invoke(manager, "InitAsyncInner", true, CancellationToken.None);
+        if (locateAfterInit)
+        {
+            ((IGameManager)manager).SetGamePath(dir);
+            Call(manager, managerType, "LoadConfig");
+        }
+        ((IGameManager)manager).IsGameHasUpdate(out bool update);
+        Assert(update == (mode != "complete"), "Incorrect update state after official UHD update");
+        string expectedVersion = mode == "complete" ? "3.7.0" : "3.6.1";
+        Assert((string?)JsonNode.Parse(File.ReadAllText(Path.Combine(dir, "app-game-config.json")))!["version"] == expectedVersion,
+            "Incorrect persisted version after official UHD update");
+    });
+
     await Test("official endpoint exposes preload while current bundle needs update", async () =>
     {
         string dir = Fresh(), manifest = Manifest("payload.bin", data);
@@ -564,6 +614,52 @@ try
         await Run(installer, GameInstallerKind.Update);
         Assert(downloads == 2 && File.Exists(Path.Combine(dir, "extra.bin")) && File.ReadAllBytes(Path.Combine(dir, "base.bin")).SequenceEqual(data) && File.Exists(Path.Combine(dir, "audio.bin")), "Patch cache not reused or another pack file deleted");
     });
+    foreach (string mode in new[] { "full", "patch", "corrupt" })
+    await Test("pack completion verification progress: " + mode, async () =>
+    {
+        string dir = Fresh(), manifest = Manifest("payload.bin", data);
+        string pack = Pack("full.json", manifest, patch: mode == "patch" ? Pack("patch.json", manifest, "base", "3.6.1") : null);
+        string config = "{\"bundles\":{\"default\":{\"resourcePacks\":[\"base\"]}},\"resourcePacks\":{\"base\":" + pack + "}}";
+        using var client = new HttpClient(new Handler(request => request.RequestUri!.AbsolutePath switch
+        {
+            var path when path.EndsWith("/index.json") => Json(config),
+            "/full.json" or "/patch.json" => Json(manifest),
+            "/base/payload.bin" => Bytes(mode == "corrupt" ? new byte[data.Length] : data),
+            _ => throw new Exception("Unexpected request: " + request.RequestUri)
+        }));
+        object manager = Manager(client, dir), installer = Installer(manager, client);
+        Call(manager, managerType, "WritePackVersion", "base", new GameVersion("3.6.1"));
+        var snapshots = new List<(InstallProgressState State, InstallProgress Progress)>();
+        InstallProgressState state = InstallProgressState.Idle;
+        bool installed = false, verifiedAfterInstall = false, completed = false;
+        void State(InstallProgressState next)
+        {
+            state = next;
+            if (next == InstallProgressState.Install) installed = true;
+            if (installed && next == InstallProgressState.Verify) verifiedAfterInstall = true;
+            if (next == InstallProgressState.Completed) completed = true;
+        }
+        void Progress(in InstallProgress progress) => snapshots.Add((state, progress));
+        var error = await Error(() => Invoke(installer, "StartPatchCoreAsync", GameInstallerKind.Update, false,
+            (InstallProgressDelegate)Progress, (InstallProgressStateDelegate)State, CancellationToken.None));
+        if (mode == "corrupt")
+        {
+            Assert(error != null && !completed && !File.Exists(Path.Combine(dir, "payload.bin")), "Corrupt pack completed");
+            Assert((string?)JsonNode.Parse(File.ReadAllText(Path.Combine(dir, "launcherDownloadConfig", "base.json")))!["version"] == "3.6.1", "Corrupt pack version promoted");
+            return;
+        }
+        Assert(error == null && completed && File.ReadAllBytes(Path.Combine(dir, "payload.bin")).SequenceEqual(data), "Pack failed: " + error);
+        if (mode == "full") Assert(!verifiedAfterInstall, "Full install repeated complete-pack verification after committing");
+        else
+        {
+            var final = snapshots.TakeLast(2).ToArray();
+            Assert(final.Length == 2 && final.All(p => p.State == InstallProgressState.Verify) &&
+                final[0].Progress.DownloadedBytes == 0 && final[0].Progress.StateCount == 0 &&
+                final[1].Progress.DownloadedBytes == data.Length && final[1].Progress.StateCount == 1,
+                "Final pack verification did not reset and advance progress");
+        }
+    });
+
     await Test("source repair verifies staging before replacing installed bytes", async () =>
     {
         string dir = Fresh(), file = Path.Combine(dir, "source.bin");

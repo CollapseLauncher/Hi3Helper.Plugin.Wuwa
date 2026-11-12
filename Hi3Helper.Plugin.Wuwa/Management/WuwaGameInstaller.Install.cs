@@ -47,6 +47,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
 
             private async Task RunAsyncCore(GameInstallerKind kind, InstallProgressDelegate? progressDelegate, InstallProgressStateDelegate? progressStateDelegate, CancellationToken token)
             {
+                _owner._verifiedResourceIndex = false;
                 SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallCoreAsync] Starting installation routine. Mode={Mode}", kind);
 
                 if (_owner.GameAssetBaseUrl is null)
@@ -377,6 +378,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 #endregion
 
                 #region Verification Phase
+                var verifiedDownloads = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
                 SharedStatic.InstanceLogger.LogInformation("[WuwaGameInstaller::StartInstallCoreAsync] Starting verification phase.");
                 Volatile.Write(ref installProgress.StateCount, 0);
                 Volatile.Write(ref installProgress.DownloadedCount, 0);
@@ -425,6 +427,8 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                         }
 
                         // Verified successfully
+                        if (entry.Size > 0 || !string.IsNullOrEmpty(entry.Md5))
+                            verifiedDownloads.TryAdd(rel, 0);
                         Interlocked.Increment(ref installProgress.StateCount);
                         Interlocked.Increment(ref installProgress.DownloadedCount);
                         if (fi.Exists)
@@ -545,8 +549,9 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 // Do not commit any files or version metadata while required downloads
                 // are missing or still invalid, including failures whose cleanup failed.
                 foreach (var kv in downloadList)
-                    await WuwaFileIntegrity.VerifyAsync(Path.Combine(tempPath, kv.Key),
-                        kv.Value.Size, kv.Value.Md5, token).ConfigureAwait(false);
+                    if (!verifiedDownloads.ContainsKey(kv.Key))
+                        await WuwaFileIntegrity.VerifyAsync(Path.Combine(tempPath, kv.Key),
+                            kv.Value.Size, kv.Value.Md5, token).ConfigureAwait(false);
 
                 if (kind == GameInstallerKind.Preload)
                 {
@@ -622,6 +627,7 @@ namespace Hi3Helper.Plugin.Wuwa.Management
                 }
 
                 // Final progress update
+                _owner._verifiedResourceIndex = true;
                 try
                 {
                     progressStateDelegate?.Invoke(InstallProgressState.Completed);

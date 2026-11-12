@@ -15,6 +15,7 @@ internal partial class WuwaGameInstaller
     private string? _operationCachePath;
     private HashSet<string>? _retainedPackFiles;
     private bool _ownsDownloadClient = true;
+    private bool _verifiedResourceIndex;
 
     private WuwaGameInstaller(WuwaGameManager manager, HttpClient client) : base(manager)
     {
@@ -145,15 +146,30 @@ internal partial class WuwaGameInstaller
                 }
                 if (kind == GameInstallerKind.Preload) continue;
                 // Check the complete origin manifest, including files omitted by the
-                // patch. Repair missing/corrupt targets before certifying the pack.
-                foreach (var entry in operation.Index.Resource)
+                // patch. Full installs already verified every target before committing.
+                if (!installer._verifiedResourceIndex)
                 {
-                    if (string.IsNullOrEmpty(entry.Dest)) continue;
-                    if (!await WuwaFileIntegrity.MatchesAsync(Path.Combine(installPath, entry.Dest.Replace('/', Path.DirectorySeparatorChar)),
-                            entry.Size, entry.Md5, token).ConfigureAwait(false))
+                    var entries = operation.Index.Resource.Where(entry => !string.IsNullOrEmpty(entry.Dest)).ToArray();
+                    var progress = new InstallProgress
                     {
-                        await new Install(installer).RunAsync(GameInstallerKind.Update, progressDelegate, State, token).ConfigureAwait(false);
-                        break;
+                        TotalBytesToDownload = entries.Sum(entry => checked((long)entry.Size)),
+                        TotalCountToDownload = entries.Length,
+                        TotalStateToComplete = entries.Length
+                    };
+                    State(InstallProgressState.Verify);
+                    progressDelegate?.Invoke(in progress);
+                    foreach (var entry in entries)
+                    {
+                        if (!await WuwaFileIntegrity.MatchesAsync(Path.Combine(installPath, entry.Dest!.Replace('/', Path.DirectorySeparatorChar)),
+                                entry.Size, entry.Md5, token).ConfigureAwait(false))
+                        {
+                            await new Install(installer).RunAsync(GameInstallerKind.Update, progressDelegate, State, token).ConfigureAwait(false);
+                            break;
+                        }
+                        progress.DownloadedBytes += checked((long)entry.Size);
+                        progress.DownloadedCount++;
+                        progress.StateCount++;
+                        progressDelegate?.Invoke(in progress);
                     }
                 }
                 manager.WritePackVersion(operation.Name, operation.Target.CurrentVersion);

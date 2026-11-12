@@ -401,7 +401,11 @@ internal partial class WuwaGameManager : GameManagerBase
         }
 
         // Re-check Kuro's launcherDownloadConfig.json now that the live API version is known.
-        if (UsesResourcePacks) return 0;
+        if (UsesResourcePacks)
+        {
+            TrySyncInstalledResourceBundleVersion();
+            return 0;
+        }
 
         TryCrossCheckKuroLauncherVersion();
 
@@ -578,6 +582,11 @@ internal partial class WuwaGameManager : GameManagerBase
 
                 // Cross-check against Kuro's launcherDownloadConfig.json to detect
                 // external updates (e.g. game updated via the official Kuro launcher).
+                if (IsInitialized && UsesResourcePacks && !IsOperationContext)
+                {
+                    NormalizeResourcePacks();
+                    TrySyncInstalledResourceBundleVersion();
+                }
                 TryCrossCheckKuroLauncherVersion();
                 LogGameStateOnce();
                 return;
