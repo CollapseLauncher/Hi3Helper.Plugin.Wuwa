@@ -29,7 +29,8 @@ internal partial class WuwaGameInstaller
         GameManager.GetApiGameVersion(out GameVersion apiVersion);
         gamePath = path ?? "";
         patch = available!;
-        return gamePath.Length > 0 &&
+        return (GameManager as WuwaGameManager)?.HasKnownHotfixUpdate == true &&
+               gamePath.Length > 0 &&
                available != null &&
                currentVersion == apiVersion &&
                currentVersion.ToString() == patch.PackageVersion &&

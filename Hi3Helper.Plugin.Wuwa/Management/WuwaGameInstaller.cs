@@ -94,13 +94,13 @@ internal partial class WuwaGameInstaller : GameInstallerBase
         await InitAsync(token).ConfigureAwait(false);
         SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetGameDownloadedSizeAsyncInner] InitAsync completed");
 
+        if (gameInstallerKind == GameInstallerKind.Update && TryGetKnownHotfix(out _, out _))
+            return await GetKnownHotfixDownloadedSizeAsync(token).ConfigureAwait(false);
+
         if (GameManager is WuwaGameManager { UsesResourcePacks: true })
             return await GetResourcePackSizeAsync(gameInstallerKind, true, token).ConfigureAwait(false);
 
-        long result = gameInstallerKind == GameInstallerKind.Update &&
-                      TryGetKnownHotfix(out _, out _)
-            ? await GetKnownHotfixDownloadedSizeAsync(token).ConfigureAwait(false)
-            : gameInstallerKind switch
+        long result = gameInstallerKind switch
         {
             GameInstallerKind.None => 0L,
             GameInstallerKind.Update or GameInstallerKind.Preload =>
@@ -127,14 +127,14 @@ internal partial class WuwaGameInstaller : GameInstallerBase
         await InitAsync(token).ConfigureAwait(false);
         SharedStatic.InstanceLogger.LogDebug("[WuwaGameInstaller::GetGameSizeAsyncInner] InitAsync completed");
 
-        if (GameManager is WuwaGameManager { UsesResourcePacks: true })
-            return await GetResourcePackSizeAsync(gameInstallerKind, false, token).ConfigureAwait(false);
-
         if (gameInstallerKind == GameInstallerKind.Update &&
             TryGetKnownHotfix(out WuwaKnownHotfixPatch hotfix, out _))
         {
             return hotfix.DownloadSize;
         }
+
+        if (GameManager is WuwaGameManager { UsesResourcePacks: true })
+            return await GetResourcePackSizeAsync(gameInstallerKind, false, token).ConfigureAwait(false);
 
         // For update/preload, compute from patch index instead of full resource index
         if (gameInstallerKind is GameInstallerKind.Update or GameInstallerKind.Preload)

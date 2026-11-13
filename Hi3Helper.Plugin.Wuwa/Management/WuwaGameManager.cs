@@ -209,6 +209,7 @@ internal partial class WuwaGameManager : GameManagerBase
         !string.IsNullOrEmpty(CurrentGameInstallPath) &&
         CurrentGameVersion == ApiGameVersion &&
         AvailableHotfixPatch is { } patch &&
+        !HasResourcePackUpdate &&
         CurrentGameVersion.ToString() == patch.PackageVersion &&
         patch.CanApply(CurrentGameInstallPath);
 
@@ -404,6 +405,7 @@ internal partial class WuwaGameManager : GameManagerBase
         if (UsesResourcePacks)
         {
             TrySyncInstalledResourceBundleVersion();
+            await DiscoverHotfixAsync(token).ConfigureAwait(false);
             return 0;
         }
 
